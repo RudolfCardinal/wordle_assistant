@@ -37,10 +37,10 @@ DEFAULT_OS_DICT = "/usr/share/dict/words"
 WORDLEN = 5
 WORD_REGEX = re.compile(rf"^[A-Z]{{{WORDLEN}}}$", re.IGNORECASE)
 CHAR_ABSENT = "_"
-CHAR_PRESENT = "O"
-CHAR_CORRECT = "X"
+CHAR_PRESENT = "-"
+CHAR_CORRECT = "="
 FEEDBACK_REGEX = re.compile(
-    rf"^[{CHAR_ABSENT}{CHAR_PRESENT}{CHAR_CORRECT}]{{{WORDLEN}}}$",  # noqa
+    rf"^[\{CHAR_ABSENT}\{CHAR_PRESENT}\{CHAR_CORRECT}]{{{WORDLEN}}}$",  # noqa
     re.IGNORECASE
 )
 
@@ -51,6 +51,10 @@ COLOUR_BG_PRESENT_RIGHT_LOCATION = "green"
 STYLE = "bold"
 
 N_GUESSES = 6
+ALL_LETTERS = tuple(
+    chr(_letter_ascii_code)
+    for _letter_ascii_code in range(ord('A'), ord('Z') + 1)
+)
 
 DEFAULT_SHOW_THRESHOLD = 100
 DEFAULT_ADVICE_TOP_N = 10
@@ -143,7 +147,7 @@ def read_words(wordlist_filename: str) -> List[str]:
 # Frequency analysis
 # -----------------------------------------------------------------------------
 
-def get_letter_frequencies(words: List[str]) -> Dict[str, float]:
+def get_letter_frequencies(words: Set[str]) -> Dict[str, float]:
     """
     For a list of words, return a dictionary that maps each letter to its
     relative frequency (including 0.0 if absent). The relative frequencies will
@@ -156,8 +160,8 @@ def get_letter_frequencies(words: List[str]) -> Dict[str, float]:
     freq = {
         # We set a score of 0.0 for anything we don't encounter, and we also
         # fix the dictionary order so it displays nicely.
-        chr(letter_ascii_code): 0.0
-        for letter_ascii_code in range(ord('A'), ord('Z') + 1)
+        letter: 0.0
+        for letter in ALL_LETTERS
     }
     letter_counts = Counter()
     for word in words:
@@ -176,7 +180,6 @@ def get_letter_frequencies(words: List[str]) -> Dict[str, float]:
     # *** Not yet done: if we know there's an "E", this continues to give
     #     points for guessing E.
     # *** Not yet done: formal "reduction of possibility space" measure.
-    # *** Not yet done: mechanism for automatically comparing methods.
 
 
 # =============================================================================
@@ -283,6 +286,96 @@ class Clue:
                     return False
         return True
 
+    def letter_known_absent(self, letter: str) -> bool:
+        """
+        Is the specified letter known to be absent from the target word, from
+        this clue?
+        """
+        for c, f in self.char_feedback_pairs:
+            if c == letter and f == CharFeedback.ABSENT:
+                return True
+        return False
+
+    def letter_known_present(self, letter: str) -> bool:
+        """
+        Is the specified letter known to be present in the target word, from
+        this clue?
+        """
+        present_codes = (CharFeedback.PRESENT_WRONG_LOCATION,
+                         CharFeedback.PRESENT_RIGHT_LOCATION)
+        for c, f in self.char_feedback_pairs:
+            if c == letter and f in present_codes:
+                return True
+        return False
+
+    def letter_known_location(self, letter: str) -> bool:
+        """
+        Is the specified letter known to be present at a known location in the
+        target word, from this clue?
+        """
+        for c, f in self.char_feedback_pairs:
+            if c == letter and f == CharFeedback.PRESENT_RIGHT_LOCATION:
+                return True
+        return False
+
+    def correct(self) -> bool:
+        """
+        Was the clue correct?
+        """
+        return all(
+            c == CharFeedback.PRESENT_RIGHT_LOCATION for c in self.feedback
+        )
+
+
+# -----------------------------------------------------------------------------
+# Alphabet
+# -----------------------------------------------------------------------------
+
+class Alphabet:
+    """
+    Represents summary information about every letter, from clues.
+    """
+    def __init__(self, clues: List[Clue]) -> None:
+        self.absent = set(
+            x
+            for x in ALL_LETTERS
+            for c in clues
+            if c.letter_known_absent(x)
+        )
+        self.present = set(
+            x
+            for x in ALL_LETTERS
+            for c in clues
+            if c.letter_known_present(x)
+        )
+        self.present_known_location = set(
+            x
+            for x in ALL_LETTERS
+            for c in clues
+            if c.letter_known_location(x)
+        )
+        self.present_unknown_location = (
+            self.present
+            - self.present_known_location
+        )
+        self.unknown = (
+            set(ALL_LETTERS)
+            - self.absent
+            - self.present
+        )
+
+    def __str__(self) -> str:
+        pk = "".join(sorted(self.present_known_location))
+        pu = "".join(sorted(self.present_unknown_location))
+        a = "".join(sorted(self.absent))
+        u = "".join(sorted(self.unknown))
+        return (
+            f"Present, known location: {pk}. "
+            f"Present, unknown location: {pu}. "
+            f"Absent: {a}. "
+            f"Unknown: {u}."
+        )
+
 
 # -----------------------------------------------------------------------------
 # Scoring potential guesses
@@ -292,7 +385,7 @@ class Clue:
 class WordScore:
     def __init__(self,
                  word: str,
-                 possible_words: List[str],
+                 possible_words: Set[str],
                  letter_frequencies_in_possible_words: Dict[str, float],
                  clues: List[Clue],
                  n_guesses_left: int):
@@ -329,15 +422,16 @@ class WordScoreExplore(WordScore):
     - min 1, median 5, mean 5.449110922946655, max 14 guesses
     """
     @property
-    def score(self) -> float:
-        if self.n_guesses_left <= 1 and self.word not in self.possible_words:
+    def score(self) -> Tuple[float, int]:
+        s = 0.0
+        possible = int(self.word in self.possible_words)
+        if self.n_guesses_left <= 1 and not possible:
             # If we have only one guess left, we must make a stab at the word
             # itself. So eliminate words that are impossible.
-            return 0.0
-        s = 0.0
+            return s, possible
         for letter in set(self.word):
             s += self.letter_freq[letter]
-        return s
+        return s, possible
 
 
 DEFAULT_SCORE_CLASS = WordScoreExplore
@@ -348,20 +442,44 @@ DEFAULT_SCORE_CLASS = WordScoreExplore
 # -----------------------------------------------------------------------------
 
 def suggest(all_words: List[str],
-            possible_words: List[str],
             clues: List[Clue],
-            n_guesses_left: int,
+            guesses_remaining: int,
             score_class: Type[WordScore] = DEFAULT_SCORE_CLASS,
+            show_threshold: int = DEFAULT_SHOW_THRESHOLD,
             top_n: int = 5,
-            silent: bool = False) -> str:
+            silent: bool = False) -> Tuple[str, bool]:
     """
     Show advice to the user: what word should be guessed next?
 
     Returns the best guess (or, the first of the equally good guesses) for
     automatic checking.
+
+    Returns: guess, certain
     """
+    possible_words = set(
+        w
+        for w in all_words
+        if all(c.compatible(w) for c in clues)
+    )
+    if len(possible_words) == 1:
+        answer = next(iter(possible_words))
+        if not silent:
+            log.info(f"Word is: {answer}")
+        return answer, True
+    elif len(possible_words) == 0:
+        raise ValueError("Word is not in our dictionary!")
+
     letter_freq = get_letter_frequencies(possible_words)
     if not silent:
+        this_guess = N_GUESSES - guesses_remaining + 1
+        log.info(f"This is guess {this_guess}. "
+                 f"Guesses remaining: {guesses_remaining}. "
+                 f"Guesses so far: {prettylist(clues)}")
+        log.info(f"Number of possible words: {len(possible_words)}")
+        if len(possible_words) <= show_threshold:
+            log.info(f"Possibilities: {prettylist(sorted(possible_words))}")
+        else:
+            log.info(f"Not yet showing possibilities (>{show_threshold})")
         log.info(f"Letter frequencies in remaining possible words: "
                  f"{letter_freq}")
 
@@ -376,7 +494,7 @@ def suggest(all_words: List[str],
             possible_words=possible_words,
             letter_frequencies_in_possible_words=letter_freq,
             clues=clues,
-            n_guesses_left=n_guesses_left
+            n_guesses_left=guesses_remaining
         )
         for w in all_words
     ]
@@ -395,7 +513,7 @@ def suggest(all_words: List[str],
         top_words.append(o.word)
     if not silent:
         log.info(f"Best suggestion(s): {prettylist(top_words)}")
-    return top_words[0]
+    return top_words[0], False
 
 
 # -----------------------------------------------------------------------------
@@ -410,43 +528,33 @@ def solve_interactive(wordlist_filename: str,
     """
     log.info("Wordle Assistant. By Rudolf Cardinal <rudolf@pobox.com>.")
     all_words = read_words(wordlist_filename)
-    possibilities = all_words
     guesses_remaining = N_GUESSES
     clues = []  # type: List[Clue]
     while guesses_remaining > 0:
         # Show the current situation
-        this_guess = N_GUESSES - guesses_remaining + 1
-        log.info(f"This is guess {this_guess}. "
-                 f"Guesses remaining: {guesses_remaining}")
-        log.info(f"Number of possible words: {len(possibilities)}")
-        if len(possibilities) <= show_threshold:
-            log.info(f"Possibilities: {prettylist(possibilities)}")
-        else:
-            log.info(f"Not yet showing possibilities (>{show_threshold})")
 
         # Provide advice
-        suggest(
+        _, _ = suggest(
             all_words=all_words,
-            possible_words=possibilities,
             clues=clues,
-            n_guesses_left=guesses_remaining,
+            guesses_remaining=guesses_remaining,
             top_n=advice_top_n
         )
 
         # Read the results of a guess
         clue = Clue.read_from_user()
         clues.append(clue)
+        if clue.correct():
+            this_guess = N_GUESSES - guesses_remaining + 1
+            log.info(f"Success in {this_guess} guesses.")
+            return
 
-        # Filter. Have we solved, or failed?
-        possibilities = [w for w in possibilities if clue.compatible(w)]
-        if len(possibilities) == 1:
-            log.info(f"Word is: {possibilities[0]}")
-            return
-        elif len(possibilities) == 0:
-            log.error("Word is not in our dictionary!")
-            return
         guesses_remaining -= 1
-    log.info(F"Out of guesses! Remaining possibilities were: {possibilities}")
+
+    log.info("Out of guesses!")
+    guess_words = [c.word for c in clues]
+    if len(guess_words) != len(set(guess_words)):
+        log.info("You are an idiot.")
 
 
 # -----------------------------------------------------------------------------
@@ -462,34 +570,23 @@ def autosolve(target: str,
     sharp edges for comparing algorithms.)
     """
     all_words = read_words(wordlist_filename)
-    possibilities = all_words
     guesses_remaining = N_GUESSES
     clues = []  # type: List[Clue]
     while True:
-        guess = suggest(
+        guess, certain = suggest(
             all_words=all_words,
-            possible_words=possibilities,
             clues=clues,
-            n_guesses_left=guesses_remaining,
+            guesses_remaining=guesses_remaining,
             score_class=score_class,
             top_n=DEFAULT_ADVICE_TOP_N,
             silent=True
         )
         clue = Clue.get_from_known_word(guess=guess, target=target)
         clues.append(clue)
-        possibilities = [w for w in possibilities if clue.compatible(w)]
-        if len(possibilities) == 1:
-            # We still have to guess it, if we didn't already.
-            answer = possibilities[0]
-            if answer != guess:
-                clues.append(
-                    Clue.get_from_known_word(guess=answer, target=target)
-                )
-            log.info(f"Word is: {possibilities[0]}. "
+        if certain:
+            log.info(f"Word is: {guess}. "
                      f"Guesses: {prettylist(clues)}")
             return clues
-        elif len(possibilities) == 0:
-            raise AssertionError("Word is not in our dictionary!")
         guesses_remaining -= 1
 
 
