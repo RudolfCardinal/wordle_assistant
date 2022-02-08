@@ -14,9 +14,11 @@ from collections import Counter
 from enum import Enum
 from functools import total_ordering
 import logging
+import multiprocessing
 import os
 import re
-from typing import Any, Dict, List, Set
+from statistics import median, mean
+from typing import Any, Dict, Iterable, List, Set, Tuple, Type, Union
 
 from colors import color  # pip install ansicolors
 from cardinal_pythonlib.logs import main_only_quicksetup_rootlogger
@@ -38,7 +40,7 @@ CHAR_ABSENT = "_"
 CHAR_PRESENT = "O"
 CHAR_CORRECT = "X"
 FEEDBACK_REGEX = re.compile(
-    rf"^[{CHAR_ABSENT}{CHAR_PRESENT}{CHAR_CORRECT}]{{{WORDLEN}}}$",
+    rf"^[{CHAR_ABSENT}{CHAR_PRESENT}{CHAR_CORRECT}]{{{WORDLEN}}}$",  # noqa
     re.IGNORECASE
 )
 
@@ -52,6 +54,7 @@ N_GUESSES = 6
 
 DEFAULT_SHOW_THRESHOLD = 100
 DEFAULT_ADVICE_TOP_N = 10
+DEFAULT_CPU_COUNT = multiprocessing.cpu_count()
 
 
 # =============================================================================
@@ -70,6 +73,10 @@ class CharFeedback(Enum):
 # =============================================================================
 # Helper functions
 # =============================================================================
+
+# -----------------------------------------------------------------------------
+# Formatting
+# -----------------------------------------------------------------------------
 
 def coloured_char(c: str, feedback: CharFeedback) -> str:
     """
@@ -94,12 +101,15 @@ def prettylist(words: List[Any]) -> str:
     return ", ".join(str(x) for x in words)
 
 
-# =============================================================================
-# Creating a wordlist
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Reading word lists
+# -----------------------------------------------------------------------------
 
 def make_wordlist(from_filename: str,
                   to_filename: str) -> None:
+    """
+    Reads a dictionary file and creates a list of 5-letter words.
+    """
     n_read = 0
     n_written = 0
     seen = set()  # type: Set[str]
@@ -114,7 +124,59 @@ def make_wordlist(from_filename: str,
                     seen.add(uppercase_word)
                     n_written += 1
     log.info(f"Read {n_read} words from {from_filename}")
-    log.info(f"Wrote {n_written} ({n_letters}-letter) words to {to_filename}")
+    log.info(f"Wrote {n_written} ({WORDLEN}-letter) words to {to_filename}")
+
+
+def read_words(wordlist_filename: str) -> List[str]:
+    """
+    Read all words from our pre-filtered wordlist.
+    """
+    words = []  # type: List[str]
+    with open(wordlist_filename) as f:
+        for line in f:
+            word = line.strip()
+            words.append(word)
+    return sorted(words)
+
+
+# -----------------------------------------------------------------------------
+# Frequency analysis
+# -----------------------------------------------------------------------------
+
+def get_letter_frequencies(words: List[str]) -> Dict[str, float]:
+    """
+    For a list of words, return a dictionary that maps each letter to its
+    relative frequency (including 0.0 if absent). The relative frequencies will
+    sum to (approximately) 1.
+
+    We don't get information about >1 position per clue, so I think we should
+    do this as frequency of "letters within words", not "letters", e.g. that
+    the word THREE contributes only one E.
+    """
+    freq = {
+        # We set a score of 0.0 for anything we don't encounter, and we also
+        # fix the dictionary order so it displays nicely.
+        chr(letter_ascii_code): 0.0
+        for letter_ascii_code in range(ord('A'), ord('Z') + 1)
+    }
+    letter_counts = Counter()
+    for word in words:
+        # Count each letter only once per word, by using set(possible_word)
+        # rather than possible_word as the iterable to update the counter.
+        letter_counts.update(set(word))
+    # For Python 3.10+, we could do:
+    #   total = letter_counts.total()
+    # but instead:
+    total = sum(v for v in letter_counts.values())
+    for letter, n in letter_counts.items():
+        freq[letter] = n / total
+    # log.debug(f"Frequency sum: {sum(v for v in freq.values())}")
+    return freq
+
+    # *** Not yet done: if we know there's an "E", this continues to give
+    #     points for guessing E.
+    # *** Not yet done: formal "reduction of possibility space" measure.
+    # *** Not yet done: mechanism for automatically comparing methods.
 
 
 # =============================================================================
@@ -122,7 +184,7 @@ def make_wordlist(from_filename: str,
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Helper classes
+# Clue
 # -----------------------------------------------------------------------------
 
 class Clue:
@@ -168,10 +230,26 @@ class Clue:
                 raise AssertionError("bug in read_from_user")
             feedback.append(f)
         clue = cls(word, feedback)
-        print(f"{prefix2} You have entered this clue: {clue.as_string()}")
+        print(f"{prefix2} You have entered this clue: {clue}")
         return clue
 
-    def as_string(self) -> str:
+    @classmethod
+    def get_from_known_word(cls, guess: str, target: str) -> "Clue":
+        """
+        For automatic testing: given that we know the word, return the clue.
+        """
+        feedback = []  # type: List[CharFeedback]
+        for g_pos, g_char in enumerate(guess):
+            if target[g_pos] == g_char:
+                f = CharFeedback.PRESENT_RIGHT_LOCATION
+            elif g_char in target:
+                f = CharFeedback.PRESENT_WRONG_LOCATION
+            else:
+                f = CharFeedback.ABSENT
+            feedback.append(f)
+        return cls(guess, feedback)
+
+    def __str__(self) -> str:
         """
         Coloured string representation.
         """
@@ -207,55 +285,8 @@ class Clue:
 
 
 # -----------------------------------------------------------------------------
-# Solver function
+# Scoring potential guesses
 # -----------------------------------------------------------------------------
-
-def read_words(wordlist_filename: str) -> List[str]:
-    """
-    Read all words from our pre-filtered wordlist.
-    """
-    words = []  # type: List[str]
-    with open(wordlist_filename) as f:
-        for line in f:
-            word = line.strip()
-            words.append(word)
-    return sorted(words)
-
-
-def get_letter_frequencies(words: List[str]) -> Dict[str, float]:
-    """
-    For a list of words, return a dictionary that maps each letter to its
-    relative frequency (including 0.0 if absent). The relative frequencies will
-    sum to (approximately) 1.
-
-    We don't get information about >1 position per clue, so I think we should
-    do this as frequency of "letters within words", not "letters", e.g. that
-    the word THREE contributes only one E.
-    """
-    freq = {
-        # We set a score of 0.0 for anything we don't encounter, and we also
-        # fix the dictionary order so it displays nicely.
-        chr(letter_ascii_code): 0.0
-        for letter_ascii_code in range(ord('A'), ord('Z') + 1)
-    }
-    letter_counts = Counter()
-    for word in words:
-        # Count each letter only once per word, by using set(possible_word)
-        # rather than possible_word as the iterable to update the counter.
-        letter_counts.update(set(word))
-    # For Python 3.10+, we could do:
-    #   total = letter_counts.total()
-    # but instead:
-    total = sum(v for v in letter_counts.values())
-    for letter, n in letter_counts.items():
-        freq[letter] = n / total
-    # log.debug(f"Frequency sum: {sum(v for v in freq.values())}")
-    return freq
-
-    # *** Not yet done: if we know there's an "E", this continues to give
-    #     points for guessing E.
-    # *** Not yet done: formal "reduction of possibility space" measure.
-
 
 @total_ordering
 class WordScore:
@@ -280,36 +311,59 @@ class WordScore:
     def __lt__(self, other: "WordScore") -> bool:
         return self.score < other.score
 
-    # -------------------------------------------------------------------------
-    # A key aspect: scoring candidate guesses to provide advice.
-    # -------------------------------------------------------------------------
+    @property
+    def score(self) -> Union[float, Iterable[float]]:
+        """
+        The key "thinking" algorithm. Returns a score for this word: how good
+        would it be to use this as the next guess?
 
+        Can return a float, or a tuple of floats, etc.
+        """
+        raise NotImplementedError
+
+
+class WordScoreExplore(WordScore):
+    """
+    Performance across our 5905 words:
+
+    - min 1, median 5, mean 5.449110922946655, max 14 guesses
+    """
     @property
     def score(self) -> float:
-        """
-        Key "thinking" algorithm. Returns a score for this word: how good would
-        it be to use this as the next guess?
-        """
-        s = 0.0
         if self.n_guesses_left <= 1 and self.word not in self.possible_words:
             # If we have only one guess left, we must make a stab at the word
-            # itself.
-            return s
+            # itself. So eliminate words that are impossible.
+            return 0.0
+        s = 0.0
         for letter in set(self.word):
             s += self.letter_freq[letter]
         return s
 
 
-def show_advice(all_words: List[str],
-                possible_words: List[str],
-                clues: List[Clue],
-                n_guesses_left: int,
-                top_n: int = 5) -> None:
+DEFAULT_SCORE_CLASS = WordScoreExplore
+
+
+# -----------------------------------------------------------------------------
+# Using a particular scoring method, calculate a best guess
+# -----------------------------------------------------------------------------
+
+def suggest(all_words: List[str],
+            possible_words: List[str],
+            clues: List[Clue],
+            n_guesses_left: int,
+            score_class: Type[WordScore] = DEFAULT_SCORE_CLASS,
+            top_n: int = 5,
+            silent: bool = False) -> str:
     """
     Show advice to the user: what word should be guessed next?
+
+    Returns the best guess (or, the first of the equally good guesses) for
+    automatic checking.
     """
     letter_freq = get_letter_frequencies(possible_words)
-    log.info(f"Letter frequencies in remaining possible words: {letter_freq}")
+    if not silent:
+        log.info(f"Letter frequencies in remaining possible words: "
+                 f"{letter_freq}")
 
     # Any word may be a candidate for a guess, not just the possibilities --
     # for example, if we know 4/5 letters in the correct positions early on, we
@@ -317,7 +371,7 @@ def show_advice(all_words: List[str],
     # letter, rather than guessing them sequentially in a single position.
     # Therefore, we generate a score for every word in all_words.
     options = [
-        WordScore(
+        score_class(
             word=w,
             possible_words=possible_words,
             letter_frequencies_in_possible_words=letter_freq,
@@ -330,7 +384,8 @@ def show_advice(all_words: List[str],
 
     # The thinking is done. Now we just need to present them nicely.
     top_n_options_str = prettylist(options[:top_n])
-    log.info(f"Top {top_n} suggestions: {top_n_options_str}")
+    if not silent:
+        log.info(f"Top {top_n} suggestions: {top_n_options_str}")
     best_score = options[0].score
     # Find the equal best suggestion(s)
     top_words = []  # type: List[str]
@@ -338,12 +393,18 @@ def show_advice(all_words: List[str],
         if o.score < best_score:
             break
         top_words.append(o.word)
-    log.info(f"Best suggestion(s): {prettylist(top_words)}")
+    if not silent:
+        log.info(f"Best suggestion(s): {prettylist(top_words)}")
+    return top_words[0]
 
 
-def solve(wordlist_filename: str,
-          show_threshold: int = DEFAULT_SHOW_THRESHOLD,
-          advice_top_n: int = DEFAULT_ADVICE_TOP_N) -> None:
+# -----------------------------------------------------------------------------
+# Interactive solver
+# -----------------------------------------------------------------------------
+
+def solve_interactive(wordlist_filename: str,
+                      show_threshold: int = DEFAULT_SHOW_THRESHOLD,
+                      advice_top_n: int = DEFAULT_ADVICE_TOP_N) -> None:
     """
     Solve in a basic way using user guesses.
     """
@@ -364,7 +425,7 @@ def solve(wordlist_filename: str,
             log.info(f"Not yet showing possibilities (>{show_threshold})")
 
         # Provide advice
-        show_advice(
+        suggest(
             all_words=all_words,
             possible_words=possibilities,
             clues=clues,
@@ -386,6 +447,91 @@ def solve(wordlist_filename: str,
             return
         guesses_remaining -= 1
     log.info(F"Out of guesses! Remaining possibilities were: {possibilities}")
+
+
+# -----------------------------------------------------------------------------
+# Autosolver and performance testing framework to compare algorithms
+# -----------------------------------------------------------------------------
+
+def autosolve(target: str,
+              wordlist_filename: str,
+              score_class: Type[WordScore] = DEFAULT_SCORE_CLASS) -> List[Clue]:
+    """
+    Automatically solves, and returns the clues from each guess (including the
+    final successful one). (This can go over the Wordle guess limit; avoid
+    sharp edges for comparing algorithms.)
+    """
+    all_words = read_words(wordlist_filename)
+    possibilities = all_words
+    guesses_remaining = N_GUESSES
+    clues = []  # type: List[Clue]
+    while True:
+        guess = suggest(
+            all_words=all_words,
+            possible_words=possibilities,
+            clues=clues,
+            n_guesses_left=guesses_remaining,
+            score_class=score_class,
+            top_n=DEFAULT_ADVICE_TOP_N,
+            silent=True
+        )
+        clue = Clue.get_from_known_word(guess=guess, target=target)
+        clues.append(clue)
+        possibilities = [w for w in possibilities if clue.compatible(w)]
+        if len(possibilities) == 1:
+            # We still have to guess it, if we didn't already.
+            answer = possibilities[0]
+            if answer != guess:
+                clues.append(
+                    Clue.get_from_known_word(guess=answer, target=target)
+                )
+            log.info(f"Word is: {possibilities[0]}. "
+                     f"Guesses: {prettylist(clues)}")
+            return clues
+        elif len(possibilities) == 0:
+            raise AssertionError("Word is not in our dictionary!")
+        guesses_remaining -= 1
+
+
+def autosolve_single_arg(args: Tuple[str, str, Type[WordScore]]) -> int:
+    """
+    Version of :func:`autosolve` that takes a single argument, which is
+    necessary for some of the parallel processing map functions.
+
+    The argument is a tuple: target, wordlist_filename, score_class.
+
+    Returns the number of guesses taken.
+    """
+    target, wordlist_filename, score_class = args
+    clues = autosolve(target, wordlist_filename, score_class)
+    n_guesses = len(clues)
+    return n_guesses
+
+
+def test_performance(
+        wordlist_filename: str,
+        score_class: Type[WordScore] = DEFAULT_SCORE_CLASS,
+        nproc: int = DEFAULT_CPU_COUNT) -> None:
+    """
+    Test a guess algorithm and report its performance statistics.
+    """
+    all_words = read_words(wordlist_filename)
+    # Workaround to pass a single argument:
+    arglist = (
+        (target, wordlist_filename, score_class)
+        for target in all_words
+    )
+    with multiprocessing.Pool(nproc) as pool:
+        guess_counts = pool.map(autosolve_single_arg, arglist)
+    n_tests = len(guess_counts)
+    assert n_tests > 0, "No words!"
+    log.info(
+        f"Across all {n_tests} known words, method {score_class} took: "
+        f"min {min(guess_counts)}, "
+        f"median {median(guess_counts)}, "
+        f"mean {mean(guess_counts)}, "
+        f"max {max(guess_counts)} guesses"
+    )
 
 
 # =============================================================================
@@ -434,6 +580,16 @@ def main() -> None:
         help="When showing advice, show this many top candidates"
     )
 
+    cmd_test_performance = "test_performance"
+    parser_test_performance = subparsers.add_parser(
+        cmd_test_performance,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser_test_performance.add_argument(
+        "--nproc", type=int,
+        help="Number of parallel processes"
+    )
+
     args = parser.parse_args()
 
     # -------------------------------------------------------------------------
@@ -448,10 +604,15 @@ def main() -> None:
     if args.command == cmd_make:
         make_wordlist(args.source_dict, args.wordlist_filename)
     elif args.command == cmd_solve:
-        solve(
+        solve_interactive(
             wordlist_filename=args.wordlist_filename,
             show_threshold=args.show_threshold,
             advice_top_n=args.advice_top_n
+        )
+    elif args.command == cmd_test_performance:
+        test_performance(
+            wordlist_filename=args.wordlist_filename,
+            nproc=args.nproc
         )
     else:
         raise AssertionError("argument-parsing bug")
