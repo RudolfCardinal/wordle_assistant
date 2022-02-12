@@ -4,6 +4,11 @@ Wordle solver.
 
 By Rudolf Cardinal <rudolf@pobox.com>, from 2022-02-08.
 
+Wordle is:
+
+- https://www.powerlanguage.co.uk/wordle/
+- https://www.nytimes.com/games/wordle/index.html
+
 Run self-tests with:
 
 .. code:: bash
@@ -11,7 +16,16 @@ Run self-tests with:
     pip install pytest
     pytest wordle.py
 
-"""
+Test algorithms with:
+
+.. code:: bash
+
+    ./wordle.py test_performance --algorithm UnknownLetterExplorer
+    ./wordle.py test_performance --algorithm UnknownLetterExplorerMindingGuessCount
+    ./wordle.py test_performance --algorithm UnknownLetterExplorerAmongstPossible
+
+
+"""  # noqa
 
 # =============================================================================
 # Imports
@@ -19,7 +33,8 @@ Run self-tests with:
 
 import argparse
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor
+from contextlib import contextmanager
+import csv
 from enum import Enum
 from functools import reduce, total_ordering
 import logging
@@ -28,12 +43,17 @@ from operator import or_
 import os
 import re
 from statistics import median, mean
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Type, Union
+from timeit import default_timer as timer
+from typing import (
+    Any, Dict, Generator, Iterable, List, Optional, Set, Tuple, Type, Union
+)
 import unittest
-from urllib.request import urlopen
 
 from colors import color  # pip install ansicolors
 from cardinal_pythonlib.logs import main_only_quicksetup_rootlogger
+from cardinal_pythonlib.maths_py import round_sf
+import numpy as np
+import ray
 
 log = logging.getLogger(__name__)
 
@@ -68,17 +88,19 @@ _FEEDBACK_REGEX_STR = (
 )
 FEEDBACK_REGEX = re.compile(_FEEDBACK_REGEX_STR, re.IGNORECASE)
 
-# Colours and styles for displaying guesses
-COLOUR_FG = "white"
-COLOUR_BG_ABSENT_REDUNDANT = "black"
-COLOUR_BG_PRESENT_WRONG_LOCATION = "orange"
-COLOUR_BG_PRESENT_RIGHT_LOCATION = "green"
-STYLE = "bold"
+# Colours and styles for displaying guesses, via the ansicolors package
+COLOUR_ABSENT_REDUNDANT = dict(fg="white", bg="black", style="bold")
+COLOUR_PRESENT_WRONG_LOCATION = dict(fg="white", bg="yellow", style="bold")
+COLOUR_PRESENT_RIGHT_LOCATION = dict(fg="white", bg="green", style="bold")
+
+# Types
+WORDSCORE_TYPE = Union[None, float, Iterable[Union[int, float]]]
 
 # Defaults
 DEFAULT_SHOW_THRESHOLD = 100
 DEFAULT_ADVICE_TOP_N = 10
 DEFAULT_NPROC = cpu_count()
+DEFAULT_SIG_FIGURES = 3
 
 
 # =============================================================================
@@ -116,20 +138,20 @@ class CharFeedback(Enum):
 # Formatting
 # -----------------------------------------------------------------------------
 
-def colourful_char(c: str, feedback: CharFeedback) -> str:
+def colourful_char(x: str, feedback: CharFeedback) -> str:
     """
     Returns a string with ANSI codes to colour the character according to the
     feedback (and then reset afterwards).
     """
     if feedback == CharFeedback.ABSENT_OR_REDUNDANT:
-        bg = COLOUR_BG_ABSENT_REDUNDANT
+        colour_params = COLOUR_ABSENT_REDUNDANT
     elif feedback == CharFeedback.PRESENT_WRONG_LOCATION:
-        bg = COLOUR_BG_PRESENT_WRONG_LOCATION
+        colour_params = COLOUR_PRESENT_WRONG_LOCATION
     elif feedback == CharFeedback.PRESENT_RIGHT_LOCATION:
-        bg = COLOUR_BG_PRESENT_RIGHT_LOCATION
+        colour_params = COLOUR_PRESENT_RIGHT_LOCATION
     else:
         raise AssertionError("bug")
-    return color(c, fg=COLOUR_FG, bg=bg, style=STYLE)
+    return color(x, **colour_params)
 
 
 def prettylist(words: Iterable[Any]) -> str:
@@ -137,6 +159,24 @@ def prettylist(words: Iterable[Any]) -> str:
     Formats a wordlist.
     """
     return ", ".join(str(x) for x in words)
+
+
+def convert_sf(x: WORDSCORE_TYPE,
+               sig_fig: int) -> WORDSCORE_TYPE:
+    """
+    Formats things to a certain number of significant figures.
+    """
+    if x is None:
+        return x
+    if isinstance(x, float):
+        return round_sf(x, sig_fig)
+    results = []
+    for y in x:
+        if isinstance(y, float):
+            results.append(round_sf(y, sig_fig))
+        else:
+            results.append(y)
+    return results
 
 
 # -----------------------------------------------------------------------------
@@ -167,10 +207,8 @@ def make_wordlist(from_filename: str,
     log.info(f"Wrote {n_written} ({WORDLEN}-letter) words to {to_filename}")
 
 
-def read_words_frequencies(wordlist_filename: str,
-                           frequencylist_filename: str = None,
-                           default_frequency: int = 1,
-                           max_n: int = None) -> Dict[str, int]:
+def read_words(wordlist_filename: str,
+               max_n: int = None) -> np.array:
     """
     Read all words, with accompanying frequencies if known, from our
     pre-filtered wordlist.
@@ -185,21 +223,10 @@ def read_words_frequencies(wordlist_filename: str,
             if max_n is not None and n_read >= max_n:
                 log.warning(f"Reading only {n_read} words")
                 break
-    freqdict = {}  # type: Dict[str, int]
-    if frequencylist_filename:
-        with open(frequencylist_filename) as f:
-            for line in f:
-                elements = line.strip().split(" ")
-                if len(elements) != 2:
-                    continue
-                word, frequency = elements
-                freqdict[word] = frequency
-    d = {}  # type: Dict[str, int]
-    for w in sorted(words):
-        d[w] = freqdict.get(w, default_frequency)
-    return d
+    return np.array(sorted(words), dtype=f"U{WORDLEN}")
 
 
+_ = '''
 def make_frequency_list(url: str,
                         to_filename: str,
                         encoding: str = "utf-8") -> None:
@@ -227,13 +254,38 @@ def make_frequency_list(url: str,
     log.info(f"Wrote {n_written} ({WORDLEN}-letter) words to {to_filename}")
 
 
+def read_words_frequencies(wordlist_filename: str,
+                           frequencylist_filename: str = None,
+                           default_frequency: int = 1,
+                           max_n: int = None) -> Dict[str, int]:
+    """
+    Read all words, with accompanying frequencies if known, from our
+    pre-filtered wordlist.
+    """
+    words = read_words(wordlist_filename, max_n)
+    freqdict = {}  # type: Dict[str, int]
+    if frequencylist_filename:
+        with open(frequencylist_filename) as f:
+            for line in f:
+                elements = line.strip().split(" ")
+                if len(elements) != 2:
+                    continue
+                word, frequency = elements
+                freqdict[word] = frequency
+    d = {}  # type: Dict[str, int]
+    for w in sorted(words):
+        d[w] = freqdict.get(w, default_frequency)
+    return d
+'''
+
+
 # -----------------------------------------------------------------------------
 # Frequency analysis
 # -----------------------------------------------------------------------------
 
 def get_letter_frequencies(words: Set[str]) -> Dict[str, float]:
     """
-    For a list of words, return a dictionary that maps each letter to its
+    For a set of words, return a dictionary that maps each letter to its
     relative frequency (including 0.0 if absent). The relative frequencies will
     sum to (approximately) 1.
 
@@ -260,6 +312,40 @@ def get_letter_frequencies(words: Set[str]) -> Dict[str, float]:
         freq[letter] = n / total
     # log.debug(f"Frequency sum: {sum(v for v in freq.values())}")
     return freq
+
+
+def get_letter_frequencies_positional(words: Set[str]) \
+        -> List[Dict[str, float]]:
+    """
+    For a set of words, return a list of length WORDLEN, each element of which
+    is a dictionary mapping each letter to its relative frequency.
+    """
+    freqlist = []  # type: List[Dict[str, float]]
+    for pos in range(WORDLEN):
+        freq = {letter: 0.0 for letter in ALL_LETTERS}
+        letter_counts = Counter()
+        for word in words:
+            letter_counts.update(word[pos])
+        total = sum(v for v in letter_counts.values())
+        for letter, n in letter_counts.items():
+            freq[letter] = n / total
+        freqlist.append(freq)
+    return freqlist
+
+
+# -----------------------------------------------------------------------------
+# Timing
+# -----------------------------------------------------------------------------
+
+@contextmanager
+def time_section(name: str,
+                 loglevel: int = logging.DEBUG) -> Generator[None, None, None]:
+    start = timer()
+    try:
+        yield
+    finally:
+        end = timer()
+        log.log(loglevel, f"{name} took {end - start} s")
 
 
 # =============================================================================
@@ -530,6 +616,12 @@ class Clue:
             c == CharFeedback.PRESENT_RIGHT_LOCATION for c in self.feedback
         )
 
+    def is_location_known(self, pos: int) -> bool:
+        """
+        Do we know the letter at this location? (Zero-based index.)
+        """
+        return self.feedback[pos] == CharFeedback.PRESENT_RIGHT_LOCATION
+
 
 # -----------------------------------------------------------------------------
 # ClueGroup
@@ -555,7 +647,7 @@ class ClueGroup:
 
     def compatible(self, guess: str) -> bool:
         """
-        Is a guess compatable with a bunch of clues?
+        Is a guess compatible with a bunch of clues?
         """
         # Basic checks quickly:
         g_letters = set(guess)  # splits string into letters
@@ -568,6 +660,32 @@ class ClueGroup:
         # In more detail:
         return all(c.compatible(guess) for c in self.clues)
 
+    @property
+    def known_positions(self) -> List[int]:
+        """
+        Character positions whose letter we know.
+        """
+        known = []  # type: List[int]
+        for pos in range(WORDLEN):
+            for clue in self.clues:
+                if clue.is_location_known(pos):
+                    known.append(pos)
+                    break
+        return known
+
+    @property
+    def unknown_positions(self) -> List[int]:
+        """
+        Character positions whose letter we know.
+        """
+        unknown = []  # type: List[int]
+        for pos in range(WORDLEN):
+            for clue in self.clues:
+                if clue.is_location_known(pos):
+                    break
+            unknown.append(pos)
+        return unknown
+
 
 # -----------------------------------------------------------------------------
 # StateInfo
@@ -578,13 +696,14 @@ class StateInfo:
     Represents summary information about where we stand.
     """
     def __init__(self,
-                 all_words: Dict[str, int],
+                 all_words: np.array,
                  clues: List[Clue],
                  guesses_remaining: int,
-                 show_threshold: int = DEFAULT_SHOW_THRESHOLD) -> None:
+                 show_threshold: int = DEFAULT_SHOW_THRESHOLD,
+                 sig_fig: Optional[int] = DEFAULT_SIG_FIGURES,
+                 previous_state: Optional["StateInfo"] = None) -> None:
         """
         Args:
-
             all_words: all words in the game
             clues: clues so far
             guesses_remaining: number of guesses remaining
@@ -594,22 +713,30 @@ class StateInfo:
         self.cluegroup = ClueGroup(clues)
         self.guesses_remaining = guesses_remaining
         self.show_threshold = show_threshold
+        self.sig_fig = sig_fig
 
         # Derived.
         self.this_guess = N_GUESSES - guesses_remaining + 1
+        # noinspection PyUnresolvedReferences
+        source = previous_state.possible_words if previous_state else all_words
         self.possible_words = set(
             w
-            for w in all_words.keys()
+            for w in source
             if self.cluegroup.compatible(w)
         )
-        self.letter_freq = get_letter_frequencies(self.possible_words)
-        self.letter_freq_unknown = self.letter_freq.copy()
-        for x in self.cluegroup.present:
-            self.letter_freq_unknown[x] = 0.0
+        self._letter_freq = None  # type: Optional[Dict[str, float]]
+        self._letter_freq_unknown = None  # type: Optional[Dict[str, float]]
+        self._letter_freq_positional = None  # type: Optional[List[Dict[str, float]]]  # noqa
 
     # -------------------------------------------------------------------------
     # Display
     # -------------------------------------------------------------------------
+
+    def _format_scoredict(self, d: Dict[str, float]) -> Dict[str, float]:
+        return {
+            k: convert_sf(v, self.sig_fig)
+            for k, v in d.items()
+        }
 
     def __str__(self) -> str:
         """
@@ -619,18 +746,21 @@ class StateInfo:
         return "\n".join([
             (
                 f"- This is guess {self.this_guess}. "
-                f"Guesses remaining: {self.guesses_remaining}. "
-                f"Number of possible words: {self.n_possible}."
+                f"Guesses remaining: {self.guesses_remaining}."
             ),
             f"- {cg}",
             (
-                f"- Possibilities: {self.pretty_possibilities}"
-                if self.n_possible <= self.show_threshold
-                else f"- Not yet showing possibilities (>{self.show_threshold})"
+                f"- Number of possible words: {self.n_possible}. " +
+                (
+                    f"Possibilities: {self.pretty_possibilities}"
+                    if self.n_possible <= self.show_threshold
+                    else f"Not yet showing possibilities "
+                         f"(>{self.show_threshold})."
+                )
             ),
             (
                 f"- Letter frequencies in remaining possible words: "
-                f"{self.letter_freq}"
+                f"{self._format_scoredict(self.letter_freq)}"
             ),
             f"- Guesses so far: {self.pretty_clues}",
             # ... last -- messes up log colour
@@ -677,6 +807,32 @@ class StateInfo:
         """
         return guess in self.possible_words
 
+    # -------------------------------------------------------------------------
+    # Letter frequency
+    # -------------------------------------------------------------------------
+
+    @property
+    def letter_freq(self) -> Dict[str, float]:
+        """
+        Returns a dictionary mapping each letter of the alphabet to its
+        relative frequency within the remaining possible words.
+        """
+        if self._letter_freq is None:
+            self._letter_freq = get_letter_frequencies(self.possible_words)
+        return self._letter_freq
+
+    @property
+    def letter_freq_unknown(self) -> Dict[str, float]:
+        """
+        As for letter_freq, but restricted to letters whose presence we're
+        unsure of.
+        """
+        if self._letter_freq_unknown is None:
+            self._letter_freq_unknown = self.letter_freq.copy()
+            for x in self.cluegroup.present:
+                self._letter_freq_unknown[x] = 0.0
+        return self._letter_freq_unknown
+
     def sum_letter_freq_unknown_for_word(self, guess: str) -> float:
         """
         Returns the sum of our "unknown" letter frequencies for unique letters
@@ -687,6 +843,28 @@ class StateInfo:
             for letter in set(guess)
         )
 
+    @property
+    def letter_freq_positional(self) -> List[Dict[str, float]]:
+        """
+        Returns a list, indexed by character position, containing dictionaries
+        mapping each letter of the alphabet to its relative frequency at that
+        position.
+        """
+        if self._letter_freq_positional is None:
+            self._letter_freq_positional = get_letter_frequencies_positional(
+                self.possible_words)
+        return self._letter_freq_positional
+
+    def sum_letter_positional_freq_unknown_for_word(self, guess: str) -> float:
+        """
+        Returns the sum of our "unknown"-position letter frequencies for unique
+        letters in the candidate word. Used by some algorithms.
+        """
+        s = 0.0
+        for pos in self.cluegroup.unknown_positions:
+            s += self.letter_freq_positional[pos][guess[pos]]
+        return s
+
 
 # -----------------------------------------------------------------------------
 # Scoring potential guesses
@@ -694,12 +872,20 @@ class StateInfo:
 
 @total_ordering
 class WordScore:
-    def __init__(self, word: str, state: StateInfo) -> None:
+    INITIAL_GUESS = None
+
+    def __init__(self, word: str, state: StateInfo,
+                 sig_fig: Optional[int] = DEFAULT_SIG_FIGURES) -> None:
         self.word = word
         self.state = state
+        self.sig_fig = sig_fig
 
     def __str__(self) -> str:
-        return f"{self.word} ({self.score})"
+        if self.sig_fig is not None:
+            score_sf = convert_sf(self.score, self.sig_fig)
+        else:
+            score_sf = self.score
+        return f"{self.word} ({score_sf})"
 
     def __eq__(self, other: "WordScore") -> bool:
         return self.score == other.score
@@ -708,7 +894,7 @@ class WordScore:
         return self.score < other.score
 
     @property
-    def score(self) -> Union[None, float, Iterable[float]]:
+    def score(self) -> WORDSCORE_TYPE:
         """
         The key "thinking" algorithm. Returns a score for this word: how good
         would it be to use this as the next guess?
@@ -718,25 +904,6 @@ class WordScore:
         Return None for suggestions so dreadful they should not be considered.
         """
         raise NotImplementedError
-
-
-class UnknownLetterExplorer(WordScore):
-    """
-    Scores guesses for the letter frequency (among possible words on a
-    letter-once-per-word basis), for letters already not known to be present.
-    Thus, explores unknown letters, preferring the most common.
-    Tie-breaker (second part of tuple): whether a word is a candidate or not.
-
-    Performance across our 5905 words:
-
-    - XXX
-    """
-    @property
-    def score(self) -> Tuple[float, int]:
-        state = self.state
-        possible = int(state.is_possible(self.word))
-        s = state.sum_letter_freq_unknown_for_word(self.word)
-        return s, possible
 
 
 class UnknownLetterExplorerMindingGuessCount(WordScore):
@@ -750,6 +917,8 @@ class UnknownLetterExplorerMindingGuessCount(WordScore):
 
     - XXX
     """
+    INITIAL_GUESS = "AROSE"
+
     @property
     def score(self) -> Optional[Tuple[float, int]]:
         state = self.state
@@ -764,7 +933,8 @@ class UnknownLetterExplorerMindingGuessCount(WordScore):
 
 class UnknownLetterExplorerAmongstPossible(WordScore):
     """
-    As for UnknownLetterExplorer, but only explores possible words.
+    As for UnknownLetterExplorerMindingGuessCount, but only explores possible
+    words.
 
     Can be especially dumb.
 
@@ -772,6 +942,8 @@ class UnknownLetterExplorerAmongstPossible(WordScore):
 
     - XXX
     """
+    INITIAL_GUESS = "AROSE"
+
     @property
     def score(self) -> Optional[float]:
         state = self.state
@@ -780,14 +952,31 @@ class UnknownLetterExplorerAmongstPossible(WordScore):
         return state.sum_letter_freq_unknown_for_word(self.word)
 
 
+class PositionalExplorer(WordScore):
+    """
+    Likes unknown letters that are common in positions we don't know.
+    """
+    @property
+    def score(self) -> Optional[Tuple[float, float]]:
+        state = self.state
+        possible = int(state.is_possible(self.word))
+        if state.guesses_remaining <= 1 and not possible:
+            # If we have only one guess left, we must make a stab at the word
+            # itself. So eliminate words that are impossible.
+            return None
+        s1 = state.sum_letter_freq_unknown_for_word(self.word)
+        s2 = state.sum_letter_positional_freq_unknown_for_word(self.word)
+        return s1, s2
+
+
 ALGORITHMS = {
-    "UnknownLetterExplorer": UnknownLetterExplorer,
     "UnknownLetterExplorerMindingGuessCount":
         UnknownLetterExplorerMindingGuessCount,
     "UnknownLetterExplorerAmongstPossible":
         UnknownLetterExplorerAmongstPossible,
+    "PositionalExplorer": PositionalExplorer,
 }  # type: Dict[str, Type[WordScore]]
-DEFAULT_ALGORITHM = "UnknownLetterExplorerAmongstPossible"
+DEFAULT_ALGORITHM = "PositionalExplorer"
 DEFAULT_ALGORITHM_CLASS = ALGORITHMS[DEFAULT_ALGORITHM]
 
 
@@ -812,7 +1001,7 @@ def suggest(state: StateInfo,
     Returns the best guess (or, the first of the equally good guesses) for
     automatic checking.
 
-    Returns: guess, certain
+    Returns: guess, certain, options
     """
     n_possible = state.n_possible
     if n_possible == 1:
@@ -825,6 +1014,10 @@ def suggest(state: StateInfo,
 
     if not silent:
         log.info(f"State:\n{state}")
+
+    if state.this_guess == 1 and score_class.INITIAL_GUESS:
+        # Speedup
+        return score_class.INITIAL_GUESS, False
 
     # Any word may be a candidate for a guess, not just the possibilities --
     # for example, if we know 4/5 letters in the correct positions early on, we
@@ -861,12 +1054,13 @@ def solve_interactive(
         wordlist_filename: str,
         show_threshold: int = DEFAULT_SHOW_THRESHOLD,
         advice_top_n: int = DEFAULT_ADVICE_TOP_N,
-        algorithm_class: Type[WordScore] = DEFAULT_ALGORITHM_CLASS) -> None:
+        algorithm_name: str = DEFAULT_ALGORITHM) -> None:
     """
     Solve in a basic way using user guesses.
     """
     log.info("Wordle Assistant. By Rudolf Cardinal <rudolf@pobox.com>.")
-    all_words = read_words_frequencies(wordlist_filename)
+    algorithm_class = ALGORITHMS[algorithm_name]
+    all_words = read_words(wordlist_filename)
     guesses_remaining = N_GUESSES
     clues = []  # type: List[Clue]
     while guesses_remaining > 0:
@@ -903,7 +1097,7 @@ def solve_interactive(
 
 def autosolve(
         target: str,
-        wordlist_filename: str,
+        all_words: Dict[str, int],
         algorithm_class: Type[WordScore] = DEFAULT_ALGORITHM_CLASS) \
         -> List[Clue]:
     """
@@ -911,11 +1105,12 @@ def autosolve(
     final successful one). (This can go over the Wordle guess limit; avoid
     sharp edges for comparing algorithms.)
     """
-    all_words = read_words_frequencies(wordlist_filename)
     guesses_remaining = N_GUESSES
     clues = []  # type: List[Clue]
+    state = None
     while True:
-        state = StateInfo(all_words, clues, guesses_remaining)
+        state = StateInfo(all_words, clues, guesses_remaining,
+                          previous_state=state)
         guess, certain = suggest(
             state,
             score_class=algorithm_class,
@@ -930,37 +1125,128 @@ def autosolve(
         guesses_remaining -= 1
 
 
-def autosolve_single_arg(args: Tuple[str, str, Type[WordScore]]) -> int:
+def autosolve_single_arg(args: Tuple[str, Dict[str, int], str]) -> int:
     """
     Version of :func:`autosolve` that takes a single argument, which is
     necessary for some of the parallel processing map functions.
 
     The argument is a tuple: target, wordlist_filename, score_class.
 
-    Returns the number of guesses taken.
+    Returns a tuple: word, n_guesses_taken.
     """
-    target, wordlist_filename, score_class = args
-    clues = autosolve(target, wordlist_filename, score_class)
+    target, all_words, algorithm_name = args
+    score_class = ALGORITHMS[algorithm_name]
+    clues = autosolve(target, all_words, score_class)
     n_guesses = len(clues)
     return n_guesses
 
 
+@ray.remote
+def autosolve_ray(target: str,
+                  all_words: Dict[str, int],
+                  algorithm_name: str,
+                  loglevel: int = logging.INFO) -> Tuple[str, int]:
+    """
+    Ray version!
+    """
+    with time_section("Word"):
+        main_only_quicksetup_rootlogger(level=loglevel)
+        score_class = ALGORITHMS[algorithm_name]
+        clues = autosolve(target, all_words, score_class)
+        n_guesses = len(clues)
+    return target, n_guesses
+
+
 def measure_algorithm_performance(
         wordlist_filename: str,
+        output_filename: str,
         nwords: int = None,
         nproc: int = DEFAULT_NPROC,
-        algorithm_class: Type[WordScore] = DEFAULT_ALGORITHM_CLASS) -> None:
+        algorithm_name: str = DEFAULT_ALGORITHM,
+        # chunks_per_worker: int = 20,
+        loglevel: int = logging.INFO) -> None:
     """
     Test a guess algorithm and report its performance statistics.
     """
-    test_words = read_words_frequencies(wordlist_filename, max_n=nwords)
-    # Workaround to pass a single argument:
-    arglist = (
-        (target, wordlist_filename, algorithm_class)
-        for target in test_words
-    )
-    with ProcessPoolExecutor(nproc) as executor:
-        guess_counts = list(executor.map(autosolve_single_arg, arglist))
+    all_words = read_words(wordlist_filename)
+    test_words = read_words(wordlist_filename, max_n=nwords)
+    guess_counts = []  # type: List[int]
+    with open(output_filename, "wt") as f:
+        writer = csv.writer(f)
+        writer.writerow(["algorithm", "word", "n_guesses"])
+
+        # ---------------------------------------------------------------------
+        # ProcessPoolExecutor method
+        # ---------------------------------------------------------------------
+        # ThreadPoolExecutor is slow -- likely limited by Python GIL.
+        #
+        # General use of ProcessPoolExecutor:
+        # - https://docs.python.org/3/library/concurrent.futures.html#processpoolexecutor-example  # noqa
+        # - https://superfastpython.com/processpoolexecutor-in-python/
+        # - https://stackoverflow.com/questions/42074501/python-concurrent-futures-processpoolexecutor-performance-of-submit-vs-map  # noqa
+        #
+        # Intermittent deadlocks (Ctrl-C shows stuck at "waiter.acquire()"):
+        # - https://britishgeologicalsurvey.github.io/science/python-forking-vs-spawn/  # noqa
+        # - https://pythonspeed.com/articles/python-multiprocessing/
+        # Argh, frustrating. Neither fork nor spawn make it simple/clear.
+        # Fork is the default under Linux.
+        # With spawn, logs are not re-enabled.
+        _ = '''
+        # Workaround to pass a single argument:
+        arglist = (
+            (target, all_words, algorithm_name)
+            for target in test_words
+        )
+        n_chunks = nproc * chunks_per_worker
+        n_words = len(test_words)
+        chunksize = max(1, n_words // n_chunks)
+        log.debug(
+            f"Aiming for {chunks_per_worker} chunks/worker with {nproc} "
+            f"workers and thus {n_chunks} chunks: for {n_words} words, "
+            f"chunksize = {chunksize} words/chunk"
+        )
+        with ProcessPoolExecutor(nproc) as executor:
+            for word, n_guesses in zip(
+                    test_words,
+                    executor.map(autosolve_single_arg, arglist,
+                                 chunksize=chunksize)):
+                writer.writerow([algorithm_name, word, n_guesses])
+                f.flush()  # nice to be able to follow the output live
+                guess_counts.append(n_guesses)
+        '''
+
+        # ---------------------------------------------------------------------
+        # Ray method
+        # ---------------------------------------------------------------------
+        log.info("Starting Ray")
+        ray.init(num_cpus=nproc)
+        result_ids = [
+            autosolve_ray.remote(target, all_words, algorithm_name, loglevel)
+            for target in test_words
+        ]
+        log.info(f"Submitted {len(result_ids)} jobs")
+        while len(result_ids):
+            done_ids, result_ids = ray.wait(result_ids)
+            log.debug(f"Another {len(done_ids)} done; "
+                      f"{len(result_ids)} pending")
+            for done_id in done_ids:
+                word, n_guesses = ray.get(done_id)
+                writer.writerow([algorithm_name, word, n_guesses])
+                f.flush()  # nice to be able to follow the output live
+                guess_counts.append(n_guesses)
+
+        # Well, that's more like it. Sensible ability to pass lots of arguments
+        # in and get tuples back, it yields results helpfully, and it doesn't
+        # crash. Also, it has commands like "ray status" (potentially "ray
+        # memory", too, but I haven't got that to work -- dependencies and then
+        # a "no module named 'aioredis.pubsub'" crash).
+        #
+        # Note:
+        # - We use np.array(words, object="U5") for 5-character Unicode
+        #   strings. Ray is optimized to pass Numpy arrays as read-only objects
+        #   without copying them. See
+        #   https://docs.ray.io/en/master/ray-core/serialization.html.
+
     n_tests = len(guess_counts)
     assert n_tests > 0, "No words!"
     tested = (
@@ -968,7 +1254,7 @@ def measure_algorithm_performance(
         else f"the first {n_tests}"
     )
     log.info(
-        f"Across {tested} words, method {algorithm_class} took: "
+        f"Across {tested} words, method {algorithm_name} took: "
         f"min {min(guess_counts)}, "
         f"median {median(guess_counts)}, "
         f"mean {mean(guess_counts)}, "
@@ -1055,11 +1341,11 @@ def main() -> None:
         "--wordlist_filename", default=DEFAULT_WORDLIST,
         help=f"File containing all {WORDLEN}-letter words in upper case"
     )
-    parser.add_argument(
-        "--freqlist_filename", default=DEFAULT_FREQLIST,
-        help=f"File containing all {WORDLEN}-letter words in upper case and "
-             f"associated frequencies"
-    )
+    # parser.add_argument(
+    #     "--freqlist_filename", default=DEFAULT_FREQLIST,
+    #     help=f"File containing all {WORDLEN}-letter words in upper case and "
+    #          f"associated frequencies"
+    # )
     parser.add_argument(
         "--verbose", "-v", action="store_true",
         help="Be verbose"
@@ -1076,16 +1362,16 @@ def main() -> None:
         help="File of all dictionary words."
     )
 
-    cmd_mkfreq = "make_frequencylist"
-    parser_mkfreq = subparsers.add_parser(
-        cmd_mkfreq,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    parser_mkfreq.add_argument(
-        "--freq_url",
-        default="https://raw.githubusercontent.com/hermitdave/FrequencyWords/master/content/2018/en/en_full.txt",  # noqa
-        help="URL for word/frequency file"
-    )
+    # cmd_mkfreq = "make_frequencylist"
+    # parser_mkfreq = subparsers.add_parser(
+    #     cmd_mkfreq,
+    #     formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    # )
+    # parser_mkfreq.add_argument(
+    #     "--freq_url",
+    #     default="https://raw.githubusercontent.com/hermitdave/FrequencyWords/master/content/2018/en/en_full.txt",  # noqa
+    #     help="URL for word/frequency file"
+    # )
 
     cmd_solve = "solve"
     parser_solve = subparsers.add_parser(
@@ -1112,6 +1398,11 @@ def main() -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser_test_performance.add_argument(
+        "--output", type=str, default=None,
+        help="File for CSV-format output (if unspecified, a sensible default "
+             "will be created based on the algorithm chosen)"
+    )
+    parser_test_performance.add_argument(
         "--nwords", type=int,
         help="Number of words to test (if unspecified, will test all)"
     )
@@ -1130,31 +1421,35 @@ def main() -> None:
     # -------------------------------------------------------------------------
     # Logging
     # -------------------------------------------------------------------------
-    main_only_quicksetup_rootlogger(level=logging.DEBUG if args.verbose
-                                    else logging.INFO)
+    loglevel = logging.DEBUG if args.verbose else logging.INFO
+    main_only_quicksetup_rootlogger(level=loglevel)
 
     # -------------------------------------------------------------------------
     # Act
     # -------------------------------------------------------------------------
     if args.command == cmd_make:
         make_wordlist(args.source_dict, args.wordlist_filename)
-    elif args.command == cmd_mkfreq:
-        make_frequency_list(args.freq_url, args.freqlist_filename)
+    # elif args.command == cmd_mkfreq:
+    #     make_frequency_list(args.freq_url, args.freqlist_filename)
     elif args.command in (cmd_solve, cmd_test_performance):
-        algorithm_class = ALGORITHMS[args.algorithm]
         if args.command == cmd_solve:
             solve_interactive(
                 wordlist_filename=args.wordlist_filename,
                 show_threshold=args.show_threshold,
                 advice_top_n=args.advice_top_n,
-                algorithm_class=algorithm_class,
+                algorithm_name=args.algorithm,
             )
         elif args.command == cmd_test_performance:
+            output_filename = (
+                args.output or f"out_{args.algorithm}.csv"
+            )
             measure_algorithm_performance(
                 wordlist_filename=args.wordlist_filename,
+                output_filename=output_filename,
                 nwords=args.nwords,
                 nproc=args.nproc,
-                algorithm_class=algorithm_class
+                algorithm_name=args.algorithm,
+                loglevel=loglevel,
             )
     else:
         raise AssertionError("argument-parsing bug")
