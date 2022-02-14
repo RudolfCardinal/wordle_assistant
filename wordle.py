@@ -1075,7 +1075,6 @@ def solve_interactive(
     Solve in a basic way using user guesses.
     """
     rootlog.info("Wordle Assistant. By Rudolf Cardinal <rudolf@pobox.com>.")
-    algorithm_class = ALGORITHMS[algorithm_name]
     all_words = read_words(wordlist_filename)
     guesses_remaining = N_GUESSES
     clues = []  # type: List[Clue]
