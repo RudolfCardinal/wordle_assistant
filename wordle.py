@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Wordle solver.
+Wordle assistant.
 
 By Rudolf Cardinal <rudolf@pobox.com>, from 2022-02-08.
 
@@ -20,10 +20,10 @@ Test algorithms with:
 
 .. code:: bash
 
-    ./wordle.py test_performance --algorithm UnknownLetterExplorer
     ./wordle.py test_performance --algorithm UnknownLetterExplorerMindingGuessCount
     ./wordle.py test_performance --algorithm UnknownLetterExplorerAmongstPossible
-
+    ./wordle.py test_performance --algorithm PositionalExplorerAmongstPossible
+    ./wordle.py test_performance --algorithm PositionalExplorerMindingGuessCount
 
 """  # noqa
 
@@ -50,12 +50,16 @@ from typing import (
 import unittest
 
 from colors import color  # pip install ansicolors
-from cardinal_pythonlib.logs import main_only_quicksetup_rootlogger
+from cardinal_pythonlib.lists import chunks
+from cardinal_pythonlib.logs import (
+    configure_logger_for_colour,
+    main_only_quicksetup_rootlogger,
+)
 from cardinal_pythonlib.maths_py import round_sf
 import numpy as np
 import ray
 
-log = logging.getLogger(__name__)
+rootlog = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -94,7 +98,7 @@ COLOUR_PRESENT_WRONG_LOCATION = dict(fg="white", bg="yellow", style="bold")
 COLOUR_PRESENT_RIGHT_LOCATION = dict(fg="white", bg="green", style="bold")
 
 # Types
-WORDSCORE_TYPE = Union[None, float, Iterable[Union[int, float]]]
+WORDSCORE_TYPE = Union[None, float, int, Iterable[Union[int, float]]]
 
 # Defaults
 DEFAULT_SHOW_THRESHOLD = 100
@@ -166,7 +170,7 @@ def convert_sf(x: WORDSCORE_TYPE,
     """
     Formats things to a certain number of significant figures.
     """
-    if x is None:
+    if x is None or isinstance(x, int):
         return x
     if isinstance(x, float):
         return round_sf(x, sig_fig)
@@ -188,8 +192,8 @@ def make_wordlist(from_filename: str,
     """
     Reads a dictionary file and creates a list of 5-letter words.
     """
-    log.info(f"Reading from {from_filename}")
-    log.info(f"Writing to {to_filename}")
+    rootlog.info(f"Reading from {from_filename}")
+    rootlog.info(f"Writing to {to_filename}")
     n_read = 0
     n_written = 0
     seen = set()  # type: Set[str]
@@ -203,8 +207,15 @@ def make_wordlist(from_filename: str,
                     t.write(uppercase_word + "\n")
                     seen.add(uppercase_word)
                     n_written += 1
-    log.info(f"Read {n_read} words from {from_filename}")
-    log.info(f"Wrote {n_written} ({WORDLEN}-letter) words to {to_filename}")
+    rootlog.info(f"Read {n_read} words from {from_filename}")
+    rootlog.info(f"Wrote {n_written} ({WORDLEN}-letter) words to {to_filename}")
+
+
+def make_np_array_words(words: List[str]) -> np.array:
+    """
+    Converts to an appropriate Numpy array type.
+    """
+    return np.array(words, dtype=f"U{WORDLEN}")
 
 
 def read_words(wordlist_filename: str,
@@ -221,9 +232,9 @@ def read_words(wordlist_filename: str,
             words.append(word)
             n_read += 1
             if max_n is not None and n_read >= max_n:
-                log.warning(f"Reading only {n_read} words")
+                rootlog.warning(f"Reading only {n_read} words")
                 break
-    return np.array(sorted(words), dtype=f"U{WORDLEN}")
+    return make_np_array_words(sorted(words))
 
 
 _ = '''
@@ -276,42 +287,6 @@ def read_words_frequencies(wordlist_filename: str,
     for w in sorted(words):
         d[w] = freqdict.get(w, default_frequency)
     return d
-'''
-
-
-# -----------------------------------------------------------------------------
-# Frequency analysis
-# -----------------------------------------------------------------------------
-
-def get_letter_frequencies(words: Set[str]) -> Dict[str, float]:
-    """
-    For a set of words, return a dictionary that maps each letter to its
-    relative frequency (including 0.0 if absent). The relative frequencies will
-    sum to (approximately) 1.
-
-    We don't get information about >1 position per clue, so I think we should
-    do this as frequency of "letters within words", not "letters", e.g. that
-    the word THREE contributes only one E.
-    """
-    freq = {
-        # We set a score of 0.0 for anything we don't encounter, and we also
-        # fix the dictionary order so it displays nicely.
-        letter: 0.0
-        for letter in ALL_LETTERS
-    }
-    letter_counts = Counter()
-    for word in words:
-        # Count each letter only once per word, by using set(possible_word)
-        # rather than possible_word as the iterable to update the counter.
-        letter_counts.update(set(word))
-    # For Python 3.10+, we could do:
-    #   total = letter_counts.total()
-    # but instead:
-    total = sum(v for v in letter_counts.values())
-    for letter, n in letter_counts.items():
-        freq[letter] = n / total
-    # log.debug(f"Frequency sum: {sum(v for v in freq.values())}")
-    return freq
 
 
 def get_letter_frequencies_positional(words: Set[str]) \
@@ -332,6 +307,8 @@ def get_letter_frequencies_positional(words: Set[str]) \
         freqlist.append(freq)
     return freqlist
 
+'''
+
 
 # -----------------------------------------------------------------------------
 # Timing
@@ -345,7 +322,7 @@ def time_section(name: str,
         yield
     finally:
         end = timer()
-        log.log(loglevel, f"{name} took {end - start} s")
+        rootlog.log(loglevel, f"{name} took {end - start} s")
 
 
 # =============================================================================
@@ -500,9 +477,15 @@ class Clue:
         for cluepos in range(WORDLEN):
             if self.feedback[cluepos] == CharFeedback.PRESENT_WRONG_LOCATION:
                 # The clue contains a letter here that must be present in the
-                # guess, IN ADDITION to any identical letter that have already
-                # been matched for position.
+                # guess, IN ADDITION to any identical letter that has already
+                # been matched for position. And it must NOT be at this
+                # location itself.
                 cluechar = self.clue_word[cluepos]
+                # (1) Not at the same location.
+                if guess[cluepos] == cluechar:
+                    # Exact match; that's wrong.
+                    return False
+                # (2) Somewhere else (but not a correct/known location).
                 found = False
                 for guesspos in guess_available_pos:
                     if guess[guesspos] == cluechar:
@@ -688,10 +671,10 @@ class ClueGroup:
 
 
 # -----------------------------------------------------------------------------
-# StateInfo
+# State
 # -----------------------------------------------------------------------------
 
-class StateInfo:
+class State:
     """
     Represents summary information about where we stand.
     """
@@ -701,7 +684,7 @@ class StateInfo:
                  guesses_remaining: int,
                  show_threshold: int = DEFAULT_SHOW_THRESHOLD,
                  sig_fig: Optional[int] = DEFAULT_SIG_FIGURES,
-                 previous_state: Optional["StateInfo"] = None) -> None:
+                 previous_state: Optional["State"] = None) -> None:
         """
         Args:
             all_words: all words in the game
@@ -724,9 +707,8 @@ class StateInfo:
             for w in source
             if self.cluegroup.compatible(w)
         )
-        self._letter_freq = None  # type: Optional[Dict[str, float]]
-        self._letter_freq_unknown = None  # type: Optional[Dict[str, float]]
-        self._letter_freq_positional = None  # type: Optional[List[Dict[str, float]]]  # noqa
+        self._letter_counter = None  # type: Optional[Counter]
+        self._letter_counters_by_pos = None  # type: Optional[List[Counter]]
 
     # -------------------------------------------------------------------------
     # Display
@@ -757,10 +739,6 @@ class StateInfo:
                     else f"Not yet showing possibilities "
                          f"(>{self.show_threshold})."
                 )
-            ),
-            (
-                f"- Letter frequencies in remaining possible words: "
-                f"{self._format_scoredict(self.letter_freq)}"
             ),
             f"- Guesses so far: {self.pretty_clues}",
             # ... last -- messes up log colour
@@ -811,59 +789,82 @@ class StateInfo:
     # Letter frequency
     # -------------------------------------------------------------------------
 
-    @property
-    def letter_freq(self) -> Dict[str, float]:
+    def letter_count(self, letter: str) -> int:
         """
-        Returns a dictionary mapping each letter of the alphabet to its
-        relative frequency within the remaining possible words.
-        """
-        if self._letter_freq is None:
-            self._letter_freq = get_letter_frequencies(self.possible_words)
-        return self._letter_freq
+        Returns the number of remaining possible words in which this letter
+        appears.
 
-    @property
-    def letter_freq_unknown(self) -> Dict[str, float]:
+        We don't get information about >1 position per clue, so I think we
+        should do this as frequency of "letters within words", not "letters",
+        e.g. that the word THREE contributes only one E.
         """
-        As for letter_freq, but restricted to letters whose presence we're
+        if self._letter_counter is None:
+            counter = Counter()
+            for word in self.possible_words:
+                # Count each letter only once per word, by using
+                # set(possible_word) rather than possible_word as the iterable
+                # to update the counter.
+                counter.update(set(word))
+            self._letter_counter = counter
+        return self._letter_counter[letter]
+
+    def letter_count_unknown(self, letter: str) -> int:
+        """
+        As for letter_count(), but restricted to letters whose presence we're
         unsure of.
         """
-        if self._letter_freq_unknown is None:
-            self._letter_freq_unknown = self.letter_freq.copy()
-            for x in self.cluegroup.present:
-                self._letter_freq_unknown[x] = 0.0
-        return self._letter_freq_unknown
+        if letter in self.cluegroup.present:
+            return 0
+        return self.letter_count(letter)
 
-    def sum_letter_freq_unknown_for_word(self, guess: str) -> float:
+    def sum_letter_count_unknown_for_word(self, guess: str) -> int:
         """
         Returns the sum of our "unknown" letter frequencies for unique letters
         in the candidate word. Used by some algorithms.
         """
         return sum(
-            self.letter_freq_unknown[letter]
+            self.letter_count_unknown(letter)
             for letter in set(guess)
         )
 
-    @property
-    def letter_freq_positional(self) -> List[Dict[str, float]]:
+    def letter_count_positional(self, letter: str, pos: int) -> int:
         """
-        Returns a list, indexed by character position, containing dictionaries
-        mapping each letter of the alphabet to its relative frequency at that
-        position.
+        Returns the number of remaining possible words in which this letter
+        appears at this position.
         """
-        if self._letter_freq_positional is None:
-            self._letter_freq_positional = get_letter_frequencies_positional(
-                self.possible_words)
-        return self._letter_freq_positional
+        if self._letter_counters_by_pos is None:
+            counters = [Counter() for _ in range(WORDLEN)]
+            for word in self.possible_words:
+                for p in range(WORDLEN):
+                    counters[p].update(word[p])
+            self._letter_counters_by_pos = counters
+        return self._letter_counters_by_pos[pos][letter]
 
-    def sum_letter_positional_freq_unknown_for_word(self, guess: str) -> float:
+    # def letter_count_positional_unknown(self, letter: str, pos: int) -> int:
+    #     """
+    #     As for letter_count_positional(), but for unknown letters.
+    #     """
+    #     if letter in self.cluegroup.present:
+    #         return 0
+    #     return self.letter_count_positional(letter, pos)
+
+    def sum_letter_count_positional_unknown_for_word(self, guess: str) -> int:
         """
         Returns the sum of our "unknown"-position letter frequencies for unique
         letters in the candidate word. Used by some algorithms.
         """
-        s = 0.0
+        counts = [0] * WORDLEN
         for pos in self.cluegroup.unknown_positions:
-            s += self.letter_freq_positional[pos][guess[pos]]
-        return s
+            counts[pos] = self.letter_count_positional(guess[pos], pos)
+        # But don't score a single letter twice:
+        countdict = {}  # type: Dict[str, int]
+        for pos, letter in enumerate(guess):
+            c = counts[pos]
+            if letter in countdict:
+                countdict[letter] = max(countdict[letter], c)
+            else:
+                countdict[letter] = c
+        return sum(countdict.values())
 
 
 # -----------------------------------------------------------------------------
@@ -874,7 +875,7 @@ class StateInfo:
 class WordScore:
     INITIAL_GUESS = None
 
-    def __init__(self, word: str, state: StateInfo,
+    def __init__(self, word: str, state: State,
                  sig_fig: Optional[int] = DEFAULT_SIG_FIGURES) -> None:
         self.word = word
         self.state = state
@@ -913,21 +914,19 @@ class UnknownLetterExplorerMindingGuessCount(WordScore):
     Thus, explores unknown letters, preferring the most common.
     Tie-breaker (second part of tuple): whether a word is a candidate or not.
 
-    Performance across our 5905 words:
-
-    - XXX
+    Performance across our 5905 words: 98.7% success.
     """
     INITIAL_GUESS = "AROSE"
 
     @property
-    def score(self) -> Optional[Tuple[float, int]]:
+    def score(self) -> Optional[Tuple[int, int]]:
         state = self.state
         possible = int(state.is_possible(self.word))
         if state.guesses_remaining <= 1 and not possible:
             # If we have only one guess left, we must make a stab at the word
             # itself. So eliminate words that are impossible.
             return None
-        s = state.sum_letter_freq_unknown_for_word(self.word)
+        s = state.sum_letter_count_unknown_for_word(self.word)
         return s, possible
 
 
@@ -936,11 +935,7 @@ class UnknownLetterExplorerAmongstPossible(WordScore):
     As for UnknownLetterExplorerMindingGuessCount, but only explores possible
     words.
 
-    Can be especially dumb.
-
-    Performance across our 5905 words:
-
-    - XXX
+    Performance across our 5905 words: 94.6% success.
     """
     INITIAL_GUESS = "AROSE"
 
@@ -949,24 +944,41 @@ class UnknownLetterExplorerAmongstPossible(WordScore):
         state = self.state
         if not state.is_possible(self.word):
             return None
-        return state.sum_letter_freq_unknown_for_word(self.word)
+        return state.sum_letter_count_unknown_for_word(self.word)
 
 
-class PositionalExplorer(WordScore):
+class PositionalExplorerAmongstPossible(WordScore):
     """
-    Likes unknown letters that are common in positions we don't know.
+    Likes unknown letters that are common in positions we don't know, amongst
+    possible words.
+
+    Performance across our 5905 words: 94.8% success.
     """
     @property
-    def score(self) -> Optional[Tuple[float, float]]:
+    def score(self) -> Optional[int]:
+        state = self.state
+        if not state.is_possible(self.word):
+            return None
+        return state.sum_letter_count_positional_unknown_for_word(self.word)
+
+
+class PositionalExplorerMindingGuessCount(WordScore):
+    """
+    Likes unknown letters that are common in positions we don't know, amongst
+    possible words.
+
+    Performance across our 5905 words: 94.8% success.
+    """
+    @property
+    def score(self) -> Optional[Tuple[int, int]]:
         state = self.state
         possible = int(state.is_possible(self.word))
         if state.guesses_remaining <= 1 and not possible:
-            # If we have only one guess left, we must make a stab at the word
-            # itself. So eliminate words that are impossible.
             return None
-        s1 = state.sum_letter_freq_unknown_for_word(self.word)
-        s2 = state.sum_letter_positional_freq_unknown_for_word(self.word)
-        return s1, s2
+        return (
+            state.sum_letter_count_positional_unknown_for_word(self.word),
+            possible
+        )
 
 
 ALGORITHMS = {
@@ -974,9 +986,10 @@ ALGORITHMS = {
         UnknownLetterExplorerMindingGuessCount,
     "UnknownLetterExplorerAmongstPossible":
         UnknownLetterExplorerAmongstPossible,
-    "PositionalExplorer": PositionalExplorer,
+    "PositionalExplorerAmongstPossible": PositionalExplorerAmongstPossible,
+    "PositionalExplorerMindingGuessCount": PositionalExplorerMindingGuessCount,
 }  # type: Dict[str, Type[WordScore]]
-DEFAULT_ALGORITHM = "PositionalExplorer"
+DEFAULT_ALGORITHM = "PositionalExplorerAmongstPossible"
 DEFAULT_ALGORITHM_CLASS = ALGORITHMS[DEFAULT_ALGORITHM]
 
 
@@ -991,10 +1004,11 @@ def filter_consider_suggestion(suggestion: WordScore) -> bool:
     return suggestion.score is not None
 
 
-def suggest(state: StateInfo,
-            score_class: Type[WordScore] = DEFAULT_ALGORITHM,
+def suggest(state: State,
+            algorithm_name: str = DEFAULT_ALGORITHM,
             top_n: int = 5,
-            silent: bool = False) -> Tuple[str, bool]:
+            silent: bool = False,
+            log: logging.Logger = None) -> Tuple[str, bool]:
     """
     Show advice to the user: what word should be guessed next?
 
@@ -1003,6 +1017,7 @@ def suggest(state: StateInfo,
 
     Returns: guess, certain, options
     """
+    log = log or rootlog
     n_possible = state.n_possible
     if n_possible == 1:
         answer = state.first_possible
@@ -1015,9 +1030,10 @@ def suggest(state: StateInfo,
     if not silent:
         log.info(f"State:\n{state}")
 
-    if state.this_guess == 1 and score_class.INITIAL_GUESS:
+    algorithm_class = ALGORITHMS[algorithm_name]
+    if state.this_guess == 1 and algorithm_class.INITIAL_GUESS:
         # Speedup
-        return score_class.INITIAL_GUESS, False
+        return algorithm_class.INITIAL_GUESS, False
 
     # Any word may be a candidate for a guess, not just the possibilities --
     # for example, if we know 4/5 letters in the correct positions early on, we
@@ -1026,14 +1042,12 @@ def suggest(state: StateInfo,
     # Therefore, we generate a score for every word in all_words.
     options = list(filter(
         filter_consider_suggestion,
-        (score_class(word=w, state=state) for w in state.all_words)
+        (algorithm_class(word=w, state=state) for w in state.all_words)
     ))
     options.sort(reverse=True)  # from high to low scores
 
     # The thinking is done. Now we just need to present them nicely.
     top_n_options_str = prettylist(options[:top_n])
-    if not silent:
-        log.info(f"Top {top_n} suggestions: {top_n_options_str}")
     best_score = options[0].score
     # Find the equal best suggestion(s)
     top_words = []  # type: List[str]
@@ -1042,7 +1056,9 @@ def suggest(state: StateInfo,
             break
         top_words.append(o.word)
     if not silent:
-        log.info(f"Best suggestion(s): {prettylist(top_words)}")
+        log.info(f"Suggestion algorithm: {algorithm_name}\n"
+                 f"- Top {top_n} suggestions: {top_n_options_str}\n"
+                 f"- Best suggestion(s): {prettylist(top_words)}")
     return top_words[0], False
 
 
@@ -1058,62 +1074,61 @@ def solve_interactive(
     """
     Solve in a basic way using user guesses.
     """
-    log.info("Wordle Assistant. By Rudolf Cardinal <rudolf@pobox.com>.")
+    rootlog.info("Wordle Assistant. By Rudolf Cardinal <rudolf@pobox.com>.")
     algorithm_class = ALGORITHMS[algorithm_name]
     all_words = read_words(wordlist_filename)
     guesses_remaining = N_GUESSES
     clues = []  # type: List[Clue]
     while guesses_remaining > 0:
         # Show the current situation
-        state = StateInfo(all_words, clues, guesses_remaining,
-                          show_threshold=show_threshold)
+        state = State(all_words, clues, guesses_remaining,
+                      show_threshold=show_threshold)
 
         # Provide advice
-        _, _ = suggest(
-            state,
-            score_class=algorithm_class,
-            top_n=advice_top_n
-        )
+        _, _ = suggest(state, algorithm_name, top_n=advice_top_n)
 
         # Read the results of a guess
         clue = Clue.read_from_user()
         clues.append(clue)
         if clue.correct():
             this_guess = N_GUESSES - guesses_remaining + 1
-            log.info(f"Success in {this_guess} guesses.")
+            rootlog.info(f"Success in {this_guess} guesses.")
             return
 
         guesses_remaining -= 1
 
-    log.info("Out of guesses!")
+    rootlog.info("Out of guesses!")
     guess_words = [c.clue_word for c in clues]
     if len(guess_words) != len(set(guess_words)):
-        log.info("You are an idiot.")
+        rootlog.info("You are an idiot.")
 
 
 # -----------------------------------------------------------------------------
 # Autosolver and performance testing framework to compare algorithms
 # -----------------------------------------------------------------------------
 
-def autosolve(
-        target: str,
-        all_words: Dict[str, int],
-        algorithm_class: Type[WordScore] = DEFAULT_ALGORITHM_CLASS) \
-        -> List[Clue]:
+def autosolve(target: str,
+              all_words: np.array,
+              algorithm_name: str,
+              allow_beyond_guess_limit: int = 100,
+              log: logging.Logger = None) -> List[Clue]:
     """
     Automatically solves, and returns the clues from each guess (including the
     final successful one). (This can go over the Wordle guess limit; avoid
     sharp edges for comparing algorithms.)
     """
+    log = log or rootlog
     guesses_remaining = N_GUESSES
     clues = []  # type: List[Clue]
     state = None
     while True:
-        state = StateInfo(all_words, clues, guesses_remaining,
-                          previous_state=state)
+        log.debug(f"... for word {target}, "
+                  f"guesses_remaining={guesses_remaining}...")
+        state = State(all_words, clues, guesses_remaining,
+                      previous_state=state)
         guess, certain = suggest(
             state,
-            score_class=algorithm_class,
+            algorithm_name=algorithm_name,
             top_n=DEFAULT_ADVICE_TOP_N,
             silent=True
         )
@@ -1123,9 +1138,12 @@ def autosolve(
             log.info(f"Word is: {guess}. Guesses: {state.pretty_clues}")
             return clues
         guesses_remaining -= 1
+        if guesses_remaining < -allow_beyond_guess_limit:
+            log.warning(f"Abandoning word {target}")
+            return clues
 
 
-def autosolve_single_arg(args: Tuple[str, Dict[str, int], str]) -> int:
+def autosolve_single_arg(args: Tuple[str, np.array, str]) -> int:
     """
     Version of :func:`autosolve` that takes a single argument, which is
     necessary for some of the parallel processing map functions.
@@ -1135,26 +1153,38 @@ def autosolve_single_arg(args: Tuple[str, Dict[str, int], str]) -> int:
     Returns a tuple: word, n_guesses_taken.
     """
     target, all_words, algorithm_name = args
-    score_class = ALGORITHMS[algorithm_name]
-    clues = autosolve(target, all_words, score_class)
+    clues = autosolve(target, all_words, algorithm_name)
     n_guesses = len(clues)
     return n_guesses
 
 
 @ray.remote
-def autosolve_ray(target: str,
-                  all_words: Dict[str, int],
+def autosolve_ray(targets: List[str],
+                  all_words: np.array,
                   algorithm_name: str,
-                  loglevel: int = logging.INFO) -> Tuple[str, int]:
+                  dummy_run: bool = False,
+                  loglevel: int = logging.INFO) -> List[Tuple[str, int]]:
     """
-    Ray version!
+    Ray version! Batched.
     """
-    with time_section("Word"):
-        main_only_quicksetup_rootlogger(level=loglevel)
-        score_class = ALGORITHMS[algorithm_name]
-        clues = autosolve(target, all_words, score_class)
-        n_guesses = len(clues)
-    return target, n_guesses
+    # Beware using logs in subprocesses?
+    # https://stackoverflow.com/questions/55272066/how-can-i-use-the-python-logging-in-ray  # noqa
+    # This works, but every time the process is launched with a new chunk,
+    # we get an additional logger!
+    raylog = logging.getLogger(__name__)
+    configure_logger_for_colour(raylog, level=loglevel)
+    results = []  # type: List[Tuple[str, int]]
+    for target in targets:
+        with time_section("Word"):
+            if dummy_run:
+                raylog.warning(f"dummy: {target}")
+                n_guesses = -1
+            else:
+                clues = autosolve(target, all_words, algorithm_name,
+                                  log=raylog)
+                n_guesses = len(clues)
+        results.append((target, n_guesses))
+    return results
 
 
 def measure_algorithm_performance(
@@ -1163,13 +1193,14 @@ def measure_algorithm_performance(
         nwords: int = None,
         nproc: int = DEFAULT_NPROC,
         algorithm_name: str = DEFAULT_ALGORITHM,
-        # chunks_per_worker: int = 20,
+        chunks_per_worker: int = 5,
         loglevel: int = logging.INFO) -> None:
     """
     Test a guess algorithm and report its performance statistics.
     """
     all_words = read_words(wordlist_filename)
-    test_words = read_words(wordlist_filename, max_n=nwords)
+    test_words = list(read_words(wordlist_filename, max_n=nwords))
+    n_words = len(test_words)
     guess_counts = []  # type: List[int]
     with open(output_filename, "wt") as f:
         writer = csv.writer(f)
@@ -1198,7 +1229,6 @@ def measure_algorithm_performance(
             for target in test_words
         )
         n_chunks = nproc * chunks_per_worker
-        n_words = len(test_words)
         chunksize = max(1, n_words // n_chunks)
         log.debug(
             f"Aiming for {chunks_per_worker} chunks/worker with {nproc} "
@@ -1218,28 +1248,34 @@ def measure_algorithm_performance(
         # ---------------------------------------------------------------------
         # Ray method
         # ---------------------------------------------------------------------
-        log.info("Starting Ray")
+        rootlog.info("Starting Ray")
         ray.init(num_cpus=nproc)
-        result_ids = [
-            autosolve_ray.remote(target, all_words, algorithm_name, loglevel)
-            for target in test_words
+        words_per_chunk = n_words // (nproc * chunks_per_worker)
+        pending_jobs = [
+            autosolve_ray.remote(targets, all_words, algorithm_name,
+                                 loglevel=loglevel)
+            for targets in chunks(test_words, words_per_chunk)
         ]
-        log.info(f"Submitted {len(result_ids)} jobs")
-        while len(result_ids):
-            done_ids, result_ids = ray.wait(result_ids)
-            log.debug(f"Another {len(done_ids)} done; "
-                      f"{len(result_ids)} pending")
-            for done_id in done_ids:
-                word, n_guesses = ray.get(done_id)
-                writer.writerow([algorithm_name, word, n_guesses])
-                f.flush()  # nice to be able to follow the output live
-                guess_counts.append(n_guesses)
+        rootlog.info(f"Submitted {len(pending_jobs)} jobs, aiming for "
+                     f"{words_per_chunk} words per job")
+        while len(pending_jobs):
+            rootlog.debug(f"Waiting for a job to complete "
+                          f"({len(pending_jobs)} running)...")
+            done_jobs, pending_jobs = ray.wait(pending_jobs)
+            for done_job in done_jobs:
+                results = ray.get(done_job)
+                rootlog.debug(f"Retrieved {len(results)} results")
+                for word, n_guesses in results:
+                    writer.writerow([algorithm_name, word, n_guesses])
+                    f.flush()  # nice to be able to follow the output live
+                    guess_counts.append(n_guesses)
 
         # Well, that's more like it. Sensible ability to pass lots of arguments
-        # in and get tuples back, it yields results helpfully, and it doesn't
-        # crash. Also, it has commands like "ray status" (potentially "ray
-        # memory", too, but I haven't got that to work -- dependencies and then
-        # a "no module named 'aioredis.pubsub'" crash).
+        # in and get tuples or other Python structures back, back, it yields
+        # results helpfully, and it doesn't crash. Also, it has commands like
+        # "ray status" (potentially "ray memory", too, but I haven't got that
+        # to work -- dependencies and then a "no module named
+        # 'aioredis.pubsub'" crash).
         #
         # Note:
         # - We use np.array(words, object="U5") for 5-character Unicode
@@ -1253,7 +1289,7 @@ def measure_algorithm_performance(
         f"all {n_tests} known" if nwords is None
         else f"the first {n_tests}"
     )
-    log.info(
+    rootlog.info(
         f"Across {tested} words, method {algorithm_name} took: "
         f"min {min(guess_counts)}, "
         f"median {median(guess_counts)}, "
@@ -1286,7 +1322,7 @@ class TestClues(unittest.TestCase):
         # Test 2: does our code agree that the correct answer is compatible
         # with the clue?
         cluegroup = ClueGroup([wordle_clue])
-        log.critical(f"cluegroup: {cluegroup}")
+        rootlog.critical(f"cluegroup: {cluegroup}")
         assert cluegroup.compatible(target), (
             f"Bug in ClueGroup.compatible(): it thinks {target} is "
             f"incompatible with the clue {wordle_clue.colourful_str}, but "
@@ -1323,6 +1359,14 @@ class TestClues(unittest.TestCase):
             wordle_feedback="_--__"
             # only the first E gets the "wrong place" marker
         )
+
+    def test_possible(self) -> None:
+        s1 = State(
+            all_words=make_np_array_words(["COINS", "SCION", "PAPER"]),
+            clues=[Clue.get_from_typed_pair("COINS", "--=--")],
+            guesses_remaining=N_GUESSES,
+        )
+        assert s1.possible_words == {"SCION"}
 
 
 # =============================================================================
