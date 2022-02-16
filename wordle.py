@@ -24,6 +24,30 @@ Test algorithms with:
     ./wordle.py test_performance --algorithm UnknownLetterExplorerAmongstPossible
     ./wordle.py test_performance --algorithm PositionalExplorerAmongstPossible
     ./wordle.py test_performance --algorithm PositionalExplorerMindingGuessCount
+    ./wordle.py test_performance --algorithm Eliminator
+    ./wordle.py test_performance --algorithm EliminatorAmongstPossible
+
+For others' (better) work, see
+
+- https://sonorouschocolate.com/notes/index.php?title=The_best_strategies_for_Wordle
+- https://towardsdatascience.com/finding-the-best-wordle-opener-with-machine-learning-ce81331c5759
+- https://www.youtube.com/watch?v=v68zYyaEmEA
+  ... particularly this one.
+- https://kotaku.com/wordle-starting-word-math-science-bot-algorithm-crane-p-1848496404
+
+Not used:
+
+- The Wordle code, or any information about its permitted guesses/answers; we
+  just use the standard Linux dictionary (or another, if you prefer). This
+  differs from most approaches I've seen. Wordle apparently uses a long guess
+  list (~13k words) and a short possible answer list (~2.5k words); the Linux
+  dictionary contains ~6k five-letter words. Wordle doesn't accept all of those
+  as guesses, though!
+
+- Information about word frequencies in English. Some code developed to use
+  this, but I think this is irrelevant -- I don't think Wordle is reflecting
+  English word frequency, just picking from a list (i.e. with a flat
+  probability).
 
 """  # noqa
 
@@ -32,11 +56,13 @@ Test algorithms with:
 # =============================================================================
 
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
 import csv
 from enum import Enum
 from functools import reduce, total_ordering
+# from itertools import product
 import logging
 from multiprocessing import cpu_count
 from operator import or_
@@ -45,7 +71,8 @@ import re
 from statistics import median, mean
 from timeit import default_timer as timer
 from typing import (
-    Any, Dict, Generator, Iterable, List, Optional, Set, Tuple, Type, Union
+    Any, Dict, Generator, Iterable, List, Optional, Sequence, Set, Tuple, Type,
+    Union
 )
 import unittest
 
@@ -75,10 +102,10 @@ DEFAULT_FREQLIST = os.path.join(THIS_DIR, "five_letter_word_frequencies.txt")
 # Defining the game
 WORDLEN = 5
 N_GUESSES = 6
-ALL_LETTERS = tuple(
-    chr(_letter_ascii_code)
-    for _letter_ascii_code in range(ord('A'), ord('Z') + 1)
-)
+# ALL_LETTERS = tuple(
+#     chr(_letter_ascii_code)
+#     for _letter_ascii_code in range(ord('A'), ord('Z') + 1)
+# )
 
 # Regular expressions to read from files or the user
 WORD_REGEX = re.compile(rf"^[A-Z]{{{WORDLEN}}}$", re.IGNORECASE)
@@ -166,7 +193,7 @@ def prettylist(words: Iterable[Any]) -> str:
 
 
 def convert_sf(x: WORDSCORE_TYPE,
-               sig_fig: int) -> WORDSCORE_TYPE:
+               sig_fig: int = DEFAULT_SIG_FIGURES) -> WORDSCORE_TYPE:
     """
     Formats things to a certain number of significant figures.
     """
@@ -337,7 +364,16 @@ class Clue:
     """
     Represents a word and its feedback.
     """
-    def __init__(self, word: str, feedback: List[CharFeedback]):
+    # _ALL_FEEDBACK_CHARS = (
+    #     CharFeedback.ABSENT_OR_REDUNDANT,
+    #     CharFeedback.PRESENT_WRONG_LOCATION,
+    #     CharFeedback.PRESENT_RIGHT_LOCATION,
+    # )
+    # ALL_FEEDBACK_COMBINATIONS = tuple(
+    #     product(*([_ALL_FEEDBACK_CHARS] * WORDLEN))
+    # )
+
+    def __init__(self, word: str, feedback: Sequence[CharFeedback]):
         """
         Args:
 
@@ -347,7 +383,7 @@ class Clue:
         assert len(word) == WORDLEN
         assert len(feedback) == WORDLEN
         self.clue_word = word.upper()
-        self.feedback = feedback
+        self.feedback = tuple(feedback)
         self.char_feedback_pairs = tuple(zip(self.clue_word, self.feedback))
         present_right_loc = set(
             c
@@ -380,27 +416,29 @@ class Clue:
         prefix1 = "-" * 57  # for presentational alignment
         prefix2 = "." * 58
         word = ""
-        while not WORD_REGEX.match(word):
-            word = input(f"{prefix1}> Enter the five-letter word: ")
-            word = word.strip().upper()
         feedback_str = ""
-        while not FEEDBACK_REGEX.match(feedback_str):
+        while not (WORD_REGEX.match(word)
+                   and FEEDBACK_REGEX.match(feedback_str)):
+            word = ""
+            while not WORD_REGEX.match(word):
+                word = input(f"{prefix1}> Enter the five-letter word: ")
+                word = word.strip().upper()
+            feedback_str = ""
             feedback_str = input(
                 f"Enter the feedback ({CHAR_ABSENT_OR_REDUNDANT!r} absent, "
                 f"{CHAR_PRESENT_WRONG_LOC!r} present but wrong location, "
                 f"{CHAR_CORRECT!r} correct location): "
             )
             feedback_str = feedback_str.strip().upper()
-        clue = cls.get_from_typed_pair(word, feedback_str)
+        clue = cls.get_from_strings(word, feedback_str)
         print(f"{prefix2} You have entered this clue: {clue}")
         return clue
 
     @classmethod
-    def get_from_typed_pair(cls, guess: str, feedback_str: str) -> "Clue":
+    def feedback_from_str(cls, feedback_str: str) -> List[CharFeedback]:
         """
-        Use our internal format to create a clue object.
+        Create coded feedback from a string.
         """
-        assert WORD_REGEX.match(guess)
         assert FEEDBACK_REGEX.match(feedback_str)
         feedback = []  # type: List[CharFeedback]
         for f_char in feedback_str:
@@ -413,6 +451,15 @@ class Clue:
             else:
                 raise AssertionError("bug in read_from_user")
             feedback.append(f)
+        return feedback
+
+    @classmethod
+    def get_from_strings(cls, guess: str, feedback_str: str) -> "Clue":
+        """
+        Use our internal string format to create a clue object.
+        """
+        assert WORD_REGEX.match(guess)
+        feedback = cls.feedback_from_str(feedback_str)
         return cls(guess, feedback)
 
     # -------------------------------------------------------------------------
@@ -540,12 +587,19 @@ class Clue:
         """
         return f"{self.clue_word}/{self.feedback_str}"
 
+    @classmethod
+    def feedback_str_from_coded(cls, feedback: Sequence[CharFeedback]) -> str:
+        """
+        Pretty version of feedback.
+        """
+        return "".join(f.plain_str for f in feedback)
+
     @property
     def feedback_str(self) -> str:
         """
         Feedback in our plain string format.
         """
-        return "".join(f.plain_str for f in self.feedback)
+        return self.feedback_str_from_coded(self.feedback)
 
     def __str__(self) -> str:
         """
@@ -866,6 +920,77 @@ class State:
                 countdict[letter] = c
         return sum(countdict.values())
 
+    # -------------------------------------------------------------------------
+    # A bit more sophisticated in terms of information provided
+    # -------------------------------------------------------------------------
+
+    def probability_of_feedback(self, guess: str, debug: bool = False) \
+            -> Dict[Tuple[CharFeedback, ...], float]:
+        """
+        Returns a dictionary whose keys are the feedback options possible for
+        this guess (given the possibilities that remain), and whose values are
+        the corresponding feedback probabilities (assuming that all possible
+        words are equiprobable).
+        """
+        counter = Counter(
+            Clue.get_from_known_word(guess, target).feedback
+            for target in self.possible_words
+        )
+        d = defaultdict(float)  # default value 0.0
+        # Python 3.10 has Counter.total(), but before then:
+        total = sum(counter.values())
+        for feedback, count in counter.items():
+            d[feedback] = count / total
+        if debug:
+            pretty_d = {
+                Clue.feedback_str_from_coded(feedback): convert_sf(p)
+                for feedback, p in d.items()
+            }
+            rootlog.debug(f"probability_of_feedback({guess!r}): {pretty_d}")
+        return d
+
+    def n_eliminated_by_clue(self, clue: Clue, debug: bool = False) -> int:
+        """
+        Returns the number of remaining possibilities that would be eliminated
+        by a specific clue (= guess + feedback).
+        """
+        n_before = len(self.possible_words)
+        n_after = sum(
+            1 for w in self.possible_words
+            if clue.compatible(w)
+        )
+        n_eliminated = n_before - n_after
+        if debug:
+            rootlog.debug(f"Clue {clue} would eliminate "
+                          f"{n_eliminated} of {n_before}, leaving {n_after}")
+        return n_eliminated
+
+    def weighted_n_eliminated(self, guess: str) -> float:
+        """
+        Returns the number of current possibilities likely to be eliminated by
+        a guess, averaged over the possible types of feedback the guess might
+        elicit (weighted for the probability of that type of feedback). Assumes
+        all possible words are equiprobable.
+
+        For example, PEEVE is a poor guess (low weighted number of words
+        eliminated) compared to PETAL; ABETS is even better. WHIZZ is an
+        example of a particularly bad first guess.
+
+        This is currently slow (about 1.1 s per guess with the initial 5905
+        words).
+        """
+        n_possible = len(self.possible_words)
+        pf = self.probability_of_feedback(guess)
+        t = 0.0
+        for feedback, p_feedback in pf.items():
+            clue = Clue(guess, feedback)
+            t += p_feedback * self.n_eliminated_by_clue(clue)
+        rootlog.debug(f"Guess {guess}: "
+                      f"weighted_n_eliminated = {t:.2f} "
+                      f"(out of {n_possible}, "
+                      f"or {convert_sf(100 * t / n_possible)}%)")
+        return t
+
 
 # -----------------------------------------------------------------------------
 # Scoring potential guesses
@@ -873,6 +998,10 @@ class State:
 
 @total_ordering
 class WordScore:
+    """
+    Class to represent the score for a potential word guess.
+    """
+    # Override this to provide the first suggestion quickly:
     INITIAL_GUESS = None
 
     def __init__(self, word: str, state: State,
@@ -880,6 +1009,7 @@ class WordScore:
         self.word = word
         self.state = state
         self.sig_fig = sig_fig
+        self._score = None  # type: Optional[WORDSCORE_TYPE]
 
     def __str__(self) -> str:
         if self.sig_fig is not None:
@@ -897,6 +1027,18 @@ class WordScore:
     @property
     def score(self) -> WORDSCORE_TYPE:
         """
+        Caches the calculated score. Caching is important as these calculations
+        can be very slow, and sorting by score involves re-retrieving scores
+        several times.
+        """
+        if self._score is None:
+            self._score = self.get_score()
+        return self._score
+
+    def get_score(self) -> WORDSCORE_TYPE:
+        """
+        Overridden to implement a specific scoring method.
+
         The key "thinking" algorithm. Returns a score for this word: how good
         would it be to use this as the next guess?
 
@@ -918,8 +1060,7 @@ class UnknownLetterExplorerMindingGuessCount(WordScore):
     """
     INITIAL_GUESS = "AROSE"
 
-    @property
-    def score(self) -> Optional[Tuple[int, int]]:
+    def get_score(self) -> Optional[Tuple[int, int]]:
         state = self.state
         possible = int(state.is_possible(self.word))
         if state.guesses_remaining <= 1 and not possible:
@@ -939,8 +1080,7 @@ class UnknownLetterExplorerAmongstPossible(WordScore):
     """
     INITIAL_GUESS = "AROSE"
 
-    @property
-    def score(self) -> Optional[float]:
+    def get_score(self) -> Optional[float]:
         state = self.state
         if not state.is_possible(self.word):
             return None
@@ -954,8 +1094,9 @@ class PositionalExplorerAmongstPossible(WordScore):
 
     Performance across our 5905 words: 94.8% success.
     """
-    @property
-    def score(self) -> Optional[int]:
+    INITIAL_GUESS = "CARES"
+
+    def get_score(self) -> Optional[int]:
         state = self.state
         if not state.is_possible(self.word):
             return None
@@ -964,13 +1105,16 @@ class PositionalExplorerAmongstPossible(WordScore):
 
 class PositionalExplorerMindingGuessCount(WordScore):
     """
-    Likes unknown letters that are common in positions we don't know, amongst
-    possible words.
+    Likes unknown letters that are common in positions we don't know, across
+    all words (except insisting on a possible word for our last guess).
 
     Performance across our 5905 words: 94.8% success.
+
+    ? problem -- same as PositionalExplorerAmongstPossible
     """
-    @property
-    def score(self) -> Optional[Tuple[int, int]]:
+    INITIAL_GUESS = "CARES"
+
+    def get_score(self) -> Optional[Tuple[int, int]]:
         state = self.state
         possible = int(state.is_possible(self.word))
         if state.guesses_remaining <= 1 and not possible:
@@ -981,6 +1125,45 @@ class PositionalExplorerMindingGuessCount(WordScore):
         )
 
 
+class Eliminator(WordScore):
+    """
+    Likes guesses that eliminate the most possibilities, in a
+    probability-weighted way.
+
+    Slow, but good.
+    """
+    INITIAL_GUESS = "RATES"
+    # - AIRES and ARIES both score top at 5780 (out of 5905), but neither are
+    #   in the Wordle list.
+    # - TARES, SANER, RATES, LANES, TALES, and REALS all come next at 5770.
+
+    def get_score(self) -> Optional[Tuple[float, int]]:
+        state = self.state
+        possible = int(state.is_possible(self.word))
+        if state.guesses_remaining <= 1 and not possible:
+            return None
+        return (
+            state.weighted_n_eliminated(self.word),
+            possible
+        )
+
+
+class EliminatorAmongstPossible(WordScore):
+    """
+    As for Eliminator, but from within current possibilities.
+
+    Much quicker (especially given that we predefine our first guess, thus
+    restricting the number of possibilities from the outset).
+    """
+    INITIAL_GUESS = "RATES"  # as for Eliminator
+
+    def get_score(self) -> Optional[float]:
+        state = self.state
+        if not state.is_possible(self.word):
+            return None
+        return state.weighted_n_eliminated(self.word)
+
+
 ALGORITHMS = {
     "UnknownLetterExplorerMindingGuessCount":
         UnknownLetterExplorerMindingGuessCount,
@@ -988,8 +1171,13 @@ ALGORITHMS = {
         UnknownLetterExplorerAmongstPossible,
     "PositionalExplorerAmongstPossible": PositionalExplorerAmongstPossible,
     "PositionalExplorerMindingGuessCount": PositionalExplorerMindingGuessCount,
+    "Eliminator": Eliminator,
+    "EliminatorAmongstPossible": EliminatorAmongstPossible,
 }  # type: Dict[str, Type[WordScore]]
-DEFAULT_ALGORITHM = "PositionalExplorerAmongstPossible"
+
+# DEFAULT_ALGORITHM = "EliminatorAmongstPossible"
+DEFAULT_ALGORITHM = "UnknownLetterExplorerMindingGuessCount"
+
 DEFAULT_ALGORITHM_CLASS = ALGORITHMS[DEFAULT_ALGORITHM]
 
 
@@ -1015,7 +1203,7 @@ def suggest(state: State,
     Returns the best guess (or, the first of the equally good guesses) for
     automatic checking.
 
-    Returns: guess, certain, options
+    Returns: guess, certain
     """
     log = log or rootlog
     n_possible = state.n_possible
@@ -1033,33 +1221,38 @@ def suggest(state: State,
     algorithm_class = ALGORITHMS[algorithm_name]
     if state.this_guess == 1 and algorithm_class.INITIAL_GUESS:
         # Speedup
-        return algorithm_class.INITIAL_GUESS, False
+        suggestion = algorithm_class.INITIAL_GUESS
+        if not silent:
+            log.info(f"Suggestion algorithm: {algorithm_name}\n"
+                     f"- Initial suggestion: {suggestion}")
+    else:
+        # Any word may be a candidate for a guess, not just the possibilities
+        # -- for example, if we know 4/5 letters in the correct positions early
+        # on, we might be better off with a guess that has lots of options for
+        # that final letter, rather than guessing them sequentially in a single
+        # position. Therefore, we generate a score for every word in all_words.
+        options = list(filter(
+            filter_consider_suggestion,
+            (algorithm_class(word=w, state=state) for w in state.all_words)
+        ))
+        options.sort(reverse=True)  # from high to low scores
 
-    # Any word may be a candidate for a guess, not just the possibilities --
-    # for example, if we know 4/5 letters in the correct positions early on, we
-    # might be better off with a guess that has lots of options for that final
-    # letter, rather than guessing them sequentially in a single position.
-    # Therefore, we generate a score for every word in all_words.
-    options = list(filter(
-        filter_consider_suggestion,
-        (algorithm_class(word=w, state=state) for w in state.all_words)
-    ))
-    options.sort(reverse=True)  # from high to low scores
+        # The thinking is done. Now we just need to present them nicely.
+        top_n_options_str = prettylist(options[:top_n])
+        best_score = options[0].score
+        # Find the equal best suggestion(s)
+        top_words = []  # type: List[str]
+        for o in options:
+            if o.score < best_score:
+                break
+            top_words.append(o.word)
+        if not silent:
+            log.info(f"Suggestion algorithm: {algorithm_name}\n"
+                     f"- Top {top_n} suggestions: {top_n_options_str}\n"
+                     f"- Best suggestion(s): {prettylist(top_words)}")
+        suggestion = top_words[0]
 
-    # The thinking is done. Now we just need to present them nicely.
-    top_n_options_str = prettylist(options[:top_n])
-    best_score = options[0].score
-    # Find the equal best suggestion(s)
-    top_words = []  # type: List[str]
-    for o in options:
-        if o.score < best_score:
-            break
-        top_words.append(o.word)
-    if not silent:
-        log.info(f"Suggestion algorithm: {algorithm_name}\n"
-                 f"- Top {top_n} suggestions: {top_n_options_str}\n"
-                 f"- Best suggestion(s): {prettylist(top_words)}")
-    return top_words[0], False
+    return suggestion, False
 
 
 # -----------------------------------------------------------------------------
@@ -1068,6 +1261,7 @@ def suggest(state: State,
 
 def solve_interactive(
         wordlist_filename: str,
+        debug_nwords: int = None,
         show_threshold: int = DEFAULT_SHOW_THRESHOLD,
         advice_top_n: int = DEFAULT_ADVICE_TOP_N,
         algorithm_name: str = DEFAULT_ALGORITHM) -> None:
@@ -1075,7 +1269,7 @@ def solve_interactive(
     Solve in a basic way using user guesses.
     """
     rootlog.info("Wordle Assistant. By Rudolf Cardinal <rudolf@pobox.com>.")
-    all_words = read_words(wordlist_filename)
+    all_words = read_words(wordlist_filename, max_n=debug_nwords)
     guesses_remaining = N_GUESSES
     clues = []  # type: List[Clue]
     while guesses_remaining > 0:
@@ -1193,7 +1387,8 @@ def measure_algorithm_performance(
         nproc: int = DEFAULT_NPROC,
         algorithm_name: str = DEFAULT_ALGORITHM,
         chunks_per_worker: int = 5,
-        loglevel: int = logging.INFO) -> None:
+        loglevel: int = logging.INFO,
+        use_ray: bool = True) -> None:
     """
     Test a guess algorithm and report its performance statistics.
     """
@@ -1205,82 +1400,87 @@ def measure_algorithm_performance(
         writer = csv.writer(f)
         writer.writerow(["algorithm", "word", "n_guesses"])
 
-        # ---------------------------------------------------------------------
-        # ProcessPoolExecutor method
-        # ---------------------------------------------------------------------
-        # ThreadPoolExecutor is slow -- likely limited by Python GIL.
-        #
-        # General use of ProcessPoolExecutor:
-        # - https://docs.python.org/3/library/concurrent.futures.html#processpoolexecutor-example  # noqa
-        # - https://superfastpython.com/processpoolexecutor-in-python/
-        # - https://stackoverflow.com/questions/42074501/python-concurrent-futures-processpoolexecutor-performance-of-submit-vs-map  # noqa
-        #
-        # Intermittent deadlocks (Ctrl-C shows stuck at "waiter.acquire()"):
-        # - https://britishgeologicalsurvey.github.io/science/python-forking-vs-spawn/  # noqa
-        # - https://pythonspeed.com/articles/python-multiprocessing/
-        # Argh, frustrating. Neither fork nor spawn make it simple/clear.
-        # Fork is the default under Linux.
-        # With spawn, logs are not re-enabled.
-        _ = '''
-        # Workaround to pass a single argument:
-        arglist = (
-            (target, all_words, algorithm_name)
-            for target in test_words
-        )
-        n_chunks = nproc * chunks_per_worker
-        chunksize = max(1, n_words // n_chunks)
-        log.debug(
-            f"Aiming for {chunks_per_worker} chunks/worker with {nproc} "
-            f"workers and thus {n_chunks} chunks: for {n_words} words, "
-            f"chunksize = {chunksize} words/chunk"
-        )
-        with ProcessPoolExecutor(nproc) as executor:
-            for word, n_guesses in zip(
-                    test_words,
-                    executor.map(autosolve_single_arg, arglist,
-                                 chunksize=chunksize)):
-                writer.writerow([algorithm_name, word, n_guesses])
-                f.flush()  # nice to be able to follow the output live
-                guess_counts.append(n_guesses)
-        '''
+        if use_ray:
+            # -----------------------------------------------------------------
+            # Ray method
+            # -----------------------------------------------------------------
+            rootlog.info("Starting Ray")
+            ray.init(num_cpus=nproc)
+            words_per_chunk = n_words // (nproc * chunks_per_worker)
+            pending_jobs = [
+                autosolve_ray.remote(targets, all_words, algorithm_name,
+                                     loglevel=loglevel)
+                for targets in chunks(test_words, words_per_chunk)
+            ]
+            rootlog.info(f"Submitted {len(pending_jobs)} jobs, aiming for "
+                         f"{words_per_chunk} words per job")
+            while len(pending_jobs):
+                rootlog.debug(f"Waiting for a job to complete "
+                              f"({len(pending_jobs)} running)...")
+                done_jobs, pending_jobs = ray.wait(pending_jobs)
+                for done_job in done_jobs:
+                    results = ray.get(done_job)
+                    rootlog.debug(f"Retrieved {len(results)} results")
+                    for word, n_guesses in results:
+                        writer.writerow([algorithm_name, word, n_guesses])
+                        f.flush()  # nice to be able to follow the output live
+                        guess_counts.append(n_guesses)
 
-        # ---------------------------------------------------------------------
-        # Ray method
-        # ---------------------------------------------------------------------
-        rootlog.info("Starting Ray")
-        ray.init(num_cpus=nproc)
-        words_per_chunk = n_words // (nproc * chunks_per_worker)
-        pending_jobs = [
-            autosolve_ray.remote(targets, all_words, algorithm_name,
-                                 loglevel=loglevel)
-            for targets in chunks(test_words, words_per_chunk)
-        ]
-        rootlog.info(f"Submitted {len(pending_jobs)} jobs, aiming for "
-                     f"{words_per_chunk} words per job")
-        while len(pending_jobs):
-            rootlog.debug(f"Waiting for a job to complete "
-                          f"({len(pending_jobs)} running)...")
-            done_jobs, pending_jobs = ray.wait(pending_jobs)
-            for done_job in done_jobs:
-                results = ray.get(done_job)
-                rootlog.debug(f"Retrieved {len(results)} results")
-                for word, n_guesses in results:
+            # Well, that's more like it. Sensible ability to pass lots of
+            # arguments in and get tuples or other Python structures back,
+            # back, it yields results helpfully, and it's elegant. Also, it
+            # has commands like "ray status" (potentially "ray memory", too,
+            # but I haven't got that to work -- dependencies and then a "no
+            # module named 'aioredis.pubsub'" crash).
+            #
+            # Note:
+            # - We use np.array(words, object="U5") for 5-character Unicode
+            #   strings. Ray is optimized to pass Numpy arrays as read-only
+            #   objects without copying them. See
+            #   https://docs.ray.io/en/master/ray-core/serialization.html.
+
+        else:
+            # -----------------------------------------------------------------
+            # ProcessPoolExecutor method
+            # -----------------------------------------------------------------
+            # ThreadPoolExecutor is slow -- likely limited by Python GIL.
+            #
+            # General use of ProcessPoolExecutor:
+            # - https://docs.python.org/3/library/concurrent.futures.html#processpoolexecutor-example  # noqa
+            # - https://superfastpython.com/processpoolexecutor-in-python/
+            # - https://stackoverflow.com/questions/42074501/python-concurrent-futures-processpoolexecutor-performance-of-submit-vs-map  # noqa
+            #
+            # Intermittent deadlocks (Ctrl-C shows stuck at
+            # "waiter.acquire()"):
+            # - https://britishgeologicalsurvey.github.io/science/python-forking-vs-spawn/  # noqa
+            # - https://pythonspeed.com/articles/python-multiprocessing/
+            # Argh, frustrating. Neither fork nor spawn make it simple/clear.
+            # Fork is the default under Linux.
+            # With spawn, logs are not re-enabled.
+            #
+            # ... was actually due to the underlying code being buggy at the
+            # time and taking infinite guesses. Cap added and bug fixed.
+
+            # Workaround to pass a single argument:
+            arglist = (
+                (target, all_words, algorithm_name)
+                for target in test_words
+            )
+            n_chunks = nproc * chunks_per_worker
+            chunksize = max(1, n_words // n_chunks)
+            rootlog.debug(
+                f"Aiming for {chunks_per_worker} chunks/worker with {nproc} "
+                f"workers and thus {n_chunks} chunks: for {n_words} words, "
+                f"chunksize = {chunksize} words/chunk"
+            )
+            with ProcessPoolExecutor(nproc) as executor:
+                for word, n_guesses in zip(
+                        test_words,
+                        executor.map(autosolve_single_arg, arglist,
+                                     chunksize=chunksize)):
                     writer.writerow([algorithm_name, word, n_guesses])
                     f.flush()  # nice to be able to follow the output live
                     guess_counts.append(n_guesses)
-
-        # Well, that's more like it. Sensible ability to pass lots of arguments
-        # in and get tuples or other Python structures back, back, it yields
-        # results helpfully, and it doesn't crash. Also, it has commands like
-        # "ray status" (potentially "ray memory", too, but I haven't got that
-        # to work -- dependencies and then a "no module named
-        # 'aioredis.pubsub'" crash).
-        #
-        # Note:
-        # - We use np.array(words, object="U5") for 5-character Unicode
-        #   strings. Ray is optimized to pass Numpy arrays as read-only objects
-        #   without copying them. See
-        #   https://docs.ray.io/en/master/ray-core/serialization.html.
 
     n_tests = len(guess_counts)
     assert n_tests > 0, "No words!"
@@ -1296,8 +1496,6 @@ def measure_algorithm_performance(
         f"max {max(guess_counts)} guesses"
     )
 
-# *** frequency by position, and match to that
-
 
 # =============================================================================
 # Self-testing
@@ -1307,7 +1505,7 @@ class TestClues(unittest.TestCase):
     @staticmethod
     def _testclue(target: str, guess: str, wordle_feedback: str) -> None:
         # Setup
-        wordle_clue = Clue.get_from_typed_pair(guess, wordle_feedback)
+        wordle_clue = Clue.get_from_strings(guess, wordle_feedback)
 
         # Test 1: do we generate the right clue?
         our_clue = Clue.get_from_known_word(guess, target)
@@ -1362,7 +1560,7 @@ class TestClues(unittest.TestCase):
     def test_possible(self) -> None:
         s1 = State(
             all_words=make_np_array_words(["COINS", "SCION", "PAPER"]),
-            clues=[Clue.get_from_typed_pair("COINS", "--=--")],
+            clues=[Clue.get_from_strings("COINS", "--=--")],
             guesses_remaining=N_GUESSES,
         )
         assert s1.possible_words == {"SCION"}
@@ -1434,6 +1632,10 @@ def main() -> None:
         default=DEFAULT_ALGORITHM,
         help="Algorithm to use"
     )
+    parser_solve.add_argument(
+        "--debug_nwords", type=int,
+        help="Number of words to load (debugging only)"
+    )
 
     cmd_test_performance = "test_performance"
     parser_test_performance = subparsers.add_parser(
@@ -1478,6 +1680,7 @@ def main() -> None:
         if args.command == cmd_solve:
             solve_interactive(
                 wordlist_filename=args.wordlist_filename,
+                debug_nwords=args.debug_nwords,
                 show_threshold=args.show_threshold,
                 advice_top_n=args.advice_top_n,
                 algorithm_name=args.algorithm,

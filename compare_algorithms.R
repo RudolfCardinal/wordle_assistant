@@ -10,7 +10,9 @@ algodata <- data.table(rbind(
     read.csv("out_UnknownLetterExplorerAmongstPossible.csv"),
     read.csv("out_UnknownLetterExplorerMindingGuessCount.csv"),
     read.csv("out_PositionalExplorerAmongstPossible.csv"),
-    read.csv("PositionalExplorerMindingGuessCount.csv")
+    read.csv("out_PositionalExplorerMindingGuessCount.csv"),
+    read.csv("out_Eliminator.csv"),
+    read.csv("out_EliminatorAmongstPossible.csv")
 ))
 
 algosummary <- (
@@ -32,6 +34,14 @@ fig <- (
     ggplot(algodata, aes(x = n_guesses, fill = algorithm)) +
     # geom_density(alpha = 0.5)
     geom_histogram(position = "dodge") +
-    scale_fill_viridis(discrete = TRUE)
+    scale_fill_viridis(discrete = TRUE) +
+    geom_vline(xintercept = MAX_GUESSES + 0.5) +
+    scale_x_continuous(
+        name = "Number of guesses",
+        breaks = 1:max(algodata$n_guesses),
+        limits = c(1, NA)
+    ) +
+    xlab("Number of guesses") +
+    ylab("Number of words")
 )
 print(fig)
