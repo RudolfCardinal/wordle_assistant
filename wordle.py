@@ -11,14 +11,14 @@ Wordle is:
 
 Run self-tests with:
 
-.. code:: bash
+.. code-block:: bash
 
     pip install pytest
     pytest wordle.py
 
 Test algorithms with:
 
-.. code:: bash
+.. code-block:: bash
 
     ./wordle.py test_performance --algorithm UnknownLetterExplorerMindingGuessCount
     ./wordle.py test_performance --algorithm UnknownLetterExplorerAmongstPossible
@@ -26,6 +26,18 @@ Test algorithms with:
     ./wordle.py test_performance --algorithm PositionalExplorerMindingGuessCount
     ./wordle.py test_performance --algorithm Eliminator
     ./wordle.py test_performance --algorithm EliminatorAmongstPossible
+
+Then run ``compare_algorithms.R``. Specimen output:
+
+.. code-block:: none
+
+                                    algorithm min median     mean max prop_success
+    1:   UnknownLetterExplorerAmongstPossible   1      4 4.254699  13    0.9458086
+    2: UnknownLetterExplorerMindingGuessCount   1      4 4.233531   9    0.9872989
+    3:      PositionalExplorerAmongstPossible   1      4 4.213378  13    0.9476715
+    4:    PositionalExplorerMindingGuessCount   1      4 4.213378  13    0.9476715
+    5:                             Eliminator   1      4 3.822523   7    0.9996613
+    6:              EliminatorAmongstPossible   1      4 4.091448  12    0.9591871
 
 For others' (better) work, see
 
@@ -415,21 +427,22 @@ class Clue:
         """
         prefix1 = "-" * 57  # for presentational alignment
         prefix2 = "." * 58
+        # We allow mis-entry of the feedback string to take you back to word
+        # entry.
         word = ""
         feedback_str = ""
         while not (WORD_REGEX.match(word)
                    and FEEDBACK_REGEX.match(feedback_str)):
             word = ""
             while not WORD_REGEX.match(word):
-                word = input(f"{prefix1}> Enter the five-letter word: ")
-                word = word.strip().upper()
-            feedback_str = ""
+                word = input(
+                    f"{prefix1}> Enter the five-letter word: "
+                ).strip().upper()
             feedback_str = input(
                 f"Enter the feedback ({CHAR_ABSENT_OR_REDUNDANT!r} absent, "
                 f"{CHAR_PRESENT_WRONG_LOC!r} present but wrong location, "
                 f"{CHAR_CORRECT!r} correct location): "
-            )
-            feedback_str = feedback_str.strip().upper()
+            ).strip().upper()
         clue = cls.get_from_strings(word, feedback_str)
         print(f"{prefix2} You have entered this clue: {clue}")
         return clue
@@ -1110,7 +1123,7 @@ class PositionalExplorerMindingGuessCount(WordScore):
 
     Performance across our 5905 words: 94.8% success.
 
-    ? problem -- same as PositionalExplorerAmongstPossible
+    ? problem -- exactly the same as PositionalExplorerAmongstPossible
     """
     INITIAL_GUESS = "CARES"
 
@@ -1131,6 +1144,9 @@ class Eliminator(WordScore):
     probability-weighted way.
 
     Slow, but good.
+    Performance across our 5905 words: 99.966% success, with a mean of 3.82.
+    (The only two it didn't achieve within 6 guesses were HAZES and WAXES,
+    which it got on 7.)
     """
     INITIAL_GUESS = "RATES"
     # - AIRES and ARIES both score top at 5780 (out of 5905), but neither are
@@ -1175,8 +1191,7 @@ ALGORITHMS = {
     "EliminatorAmongstPossible": EliminatorAmongstPossible,
 }  # type: Dict[str, Type[WordScore]]
 
-# DEFAULT_ALGORITHM = "EliminatorAmongstPossible"
-DEFAULT_ALGORITHM = "UnknownLetterExplorerMindingGuessCount"
+DEFAULT_ALGORITHM = "Eliminator"  # it's the best
 
 DEFAULT_ALGORITHM_CLASS = ALGORITHMS[DEFAULT_ALGORITHM]
 
