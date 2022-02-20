@@ -1200,6 +1200,29 @@ DEFAULT_ALGORITHM_CLASS = ALGORITHMS[DEFAULT_ALGORITHM]
 # Using a particular scoring method, calculate a best guess
 # -----------------------------------------------------------------------------
 
+@ray.remote
+def suggest_ray(algorithm_class: Type[WordScore],
+                test_words: Iterable[str],
+                state: State) -> List[WordScore]:
+    """
+    Helper function for a parallel version. This worker task scores a bunch of
+    words (a subset of the full set).
+    """
+    return [algorithm_class(word=w, state=state) for w in test_words]
+
+
+def flatten(x: Iterable[Any]) -> Iterable[Any]:
+    """
+    Flatten, for example, a list of lists to an iterable of the items.
+    """
+    for y in x:
+        if isinstance(y, list):
+            for item in y:
+                yield item
+        else:
+            yield y
+
+
 def filter_consider_suggestion(suggestion: WordScore) -> bool:
     """
     Filter to reject awful suggestions.
@@ -1211,7 +1234,8 @@ def suggest(state: State,
             algorithm_name: str = DEFAULT_ALGORITHM,
             top_n: int = 5,
             silent: bool = False,
-            log: logging.Logger = None) -> Tuple[str, bool]:
+            log: logging.Logger = None,
+            nproc: int = 1) -> Tuple[str, bool]:
     """
     Show advice to the user: what word should be guessed next?
 
@@ -1219,6 +1243,8 @@ def suggest(state: State,
     automatic checking.
 
     Returns: guess, certain
+
+    Parallelization doesn't really help, but the framework code is done.
     """
     log = log or rootlog
     n_possible = state.n_possible
@@ -1246,11 +1272,21 @@ def suggest(state: State,
         # on, we might be better off with a guess that has lots of options for
         # that final letter, rather than guessing them sequentially in a single
         # position. Therefore, we generate a score for every word in all_words.
-        options = list(filter(
-            filter_consider_suggestion,
-            (algorithm_class(word=w, state=state) for w in state.all_words)
-        ))
-        options.sort(reverse=True)  # from high to low scores
+        if nproc > 1:
+            chunks_per_task = 1
+            words_per_chunk = len(state.all_words) // (nproc * chunks_per_task)
+            wordgen = flatten(ray.get([
+                suggest_ray.remote(algorithm_class, test_words, state)
+                for test_words in chunks(state.all_words, words_per_chunk)
+            ]))
+        else:
+            wordgen = (
+                algorithm_class(word=w, state=state) for w in state.all_words
+            )
+        options = sorted(
+            filter(filter_consider_suggestion, wordgen),
+            reverse=True  # from high to low scores
+        )
 
         # The thinking is done. Now we just need to present them nicely.
         top_n_options_str = prettylist(options[:top_n])
@@ -1338,7 +1374,8 @@ def autosolve(target: str,
             state,
             algorithm_name=algorithm_name,
             top_n=DEFAULT_ADVICE_TOP_N,
-            silent=True
+            silent=True,
+            nproc=1  # parallelize over words instead
         )
         clue = Clue.get_from_known_word(guess=guess, target=target)
         clues.append(clue)
@@ -1579,6 +1616,19 @@ class TestClues(unittest.TestCase):
             guesses_remaining=N_GUESSES,
         )
         assert s1.possible_words == {"SCION"}
+
+    def test_specific(self) -> None:
+        # These days, if something goes wrong, it should be because the user
+        # mistyped the clue feedback! That was the case here.
+        s1 = State(
+            all_words=make_np_array_words(["TACIT"]),
+            clues=[
+                Clue.get_from_strings("RATES", "_=-__"),
+                Clue.get_from_strings("TYING", "=_-__"),
+            ],
+            guesses_remaining=N_GUESSES,
+        )
+        assert "TACIT" in s1.possible_words
 
 
 # =============================================================================
